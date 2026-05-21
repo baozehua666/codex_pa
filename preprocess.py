@@ -337,15 +337,25 @@ def detect_patterns(bars, baseline_body):
                     "level": round(min(bars[i]["low"], bars[j]["low"]), 4),
                 })
 
-    for group in (raw_dt, raw_db):
-        kept = []
+    # Deduplicate DT and DB independently
+    kept_dt, kept_db = [], []
+    for group, kept in ((raw_dt, kept_dt), (raw_db, kept_db)):
         for p in reversed(group):
             if not any(abs(p["level"] - k["level"]) / max(p["level"], 1) < 0.002
                        for k in kept):
                 kept.append(p)
             if len(kept) >= 3:
                 break
-        patterns.extend(reversed(kept))
+
+    # Suppress overlapping DT/DB (same bars → TR noise, not directional signal)
+    dt_bar_sets = [frozenset(p["bars"]) for p in kept_dt]
+    db_bar_sets = [frozenset(p["bars"]) for p in kept_db]
+    for p in reversed(kept_dt):
+        if not any(frozenset(p["bars"]) == bs for bs in db_bar_sets):
+            patterns.append(p)
+    for p in reversed(kept_db):
+        if not any(frozenset(p["bars"]) == bs for bs in dt_bar_sets):
+            patterns.append(p)
 
     return patterns
 
@@ -553,11 +563,16 @@ def process(code, full_output=False):
     today_count = len(bars_5m) - t_start
 
     # Gap
-    gap = {"size": 0, "pct_of_adr": 0}
+    gap = {"size": 0, "pct_of_adr": 0, "classification": "none"}
     if prior_day and today_count > 0:
         gap_size = round(bars_5m[t_start]["open"] - prior_day["close"], 4)
         gap["size"] = gap_size
-        gap["pct_of_adr"] = round(gap_size / adr * 100, 2) if adr else 0
+        gap_pct = round(gap_size / adr * 100, 2) if adr else 0
+        gap["pct_of_adr"] = gap_pct
+        abs_pct = abs(gap_pct)
+        gap["classification"] = (
+            "large" if abs_pct > 50 else "medium" if abs_pct > 25 else "small" if abs_pct > 5 else "none"
+        )
 
     # --- Intraday ---
     closes_5m = [b["close"] for b in bars_5m]
@@ -619,6 +634,52 @@ def process(code, full_output=False):
         "lows": [{"idx": idx + sp_offset, "level": round(v, 4)} for idx, v in sp_lows],
     }
 
+    # --- EMA metrics (today's bars only) ---
+    ema_crosses_today = 0
+    if today_count >= 2:
+        for i in range(t_start + 1, len(bars_5m)):
+            e_prev = bars_5m[i - 1].get("ema20")
+            e_curr = bars_5m[i].get("ema20")
+            if e_prev and e_curr:
+                prev_above = bars_5m[i - 1]["close"] > e_prev
+                curr_above = bars_5m[i]["close"] > e_curr
+                if prev_above != curr_above:
+                    ema_crosses_today += 1
+
+    ema_slope = 0
+    if ema20_5m and len(ema20_5m) >= 5:
+        recent_ema = ema20_5m[-5:]
+        ema_slope = round((recent_ema[-1] - recent_ema[0]) / max(abs(recent_ema[0]), 1) * 100, 4)
+
+    ema_distance_pct = 0
+    if ema20_5m and bars_5m and adr > 0:
+        ema_distance_pct = round((bars_5m[-1]["close"] - ema20_5m[-1]) / adr * 100, 2)
+
+    # --- Bar stats (today only) ---
+    bar_balance = {"bull": 0, "bear": 0, "neutral": 0, "bias": "balanced"}
+    bar_stats = {"inside_count": 0, "outside_count": 0, "outside_pct": 0}
+    if today_count > 0:
+        today_bars = bars_5m[t_start:]
+        for b in today_bars:
+            bt = b.get("bar_type", "")
+            if "bull" in bt:
+                bar_balance["bull"] += 1
+            elif "bear" in bt:
+                bar_balance["bear"] += 1
+            else:
+                bar_balance["neutral"] += 1
+            if b.get("is_inside"):
+                bar_stats["inside_count"] += 1
+            if b.get("is_outside"):
+                bar_stats["outside_count"] += 1
+
+        total = bar_balance["bull"] + bar_balance["bear"]
+        if total > 0:
+            bull_pct = bar_balance["bull"] / total
+            bar_balance["bias"] = "bull" if bull_pct > 0.6 else "bear" if bull_pct < 0.4 else "balanced"
+
+        bar_stats["outside_pct"] = round(bar_stats["outside_count"] / today_count * 100, 1)
+
     # --- Build output bars (compact by default) ---
     if full_output:
         out_start = 0
@@ -661,8 +722,13 @@ def process(code, full_output=False):
         "intraday": {
             "baseline_body": baseline_body,
             "ema20_current": round(ema20_5m[-1], 4) if ema20_5m else None,
+            "ema20_slope": ema_slope,
+            "ema20_distance_pct": ema_distance_pct,
+            "ema_crosses_today": ema_crosses_today,
             "today_range": {"high": round(today_high, 4), "low": round(today_low, 4)},
             "adr_consumed_pct": adr_consumed_pct,
+            "bar_balance": bar_balance,
+            "bar_stats": bar_stats,
             "micro_channel": micro_ch,
             "patterns": patterns,
             "three_pushes": three_pushes,

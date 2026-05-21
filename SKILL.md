@@ -143,13 +143,18 @@ The script returns a single JSON object with **all data pre-computed**:
 | `daily.ema20` | True EMA20 from 25 daily bars (pandas ewm, not SMA approximation) |
 | `daily.adr` | Average daily range (20-day mean of high-low) |
 | `daily.prior_day` | Prior day OHLC + bar_type |
-| `daily.gap` | Gap size and % of ADR |
+| `daily.gap` | Gap size, % of ADR, and classification (none/small/medium/large). Large = >50% ADR |
 | `intraday.baseline_body` | Mean body size of last 20 five-minute bars |
 | `intraday.ema20_current` | Current 5-min EMA20 value |
+| `intraday.ema20_slope` | EMA20 slope (% change over last 5 bars). Positive=rising, negative=falling |
+| `intraday.ema20_distance_pct` | Price distance from EMA20 as % of ADR. Positive=above, negative=below |
+| `intraday.ema_crosses_today` | Number of EMA20 crosses today. ≥5 = EMA unreliable for direction |
 | `intraday.today_range` | Today's high/low |
 | `intraday.adr_consumed_pct` | Today's range as % of ADR |
+| `intraday.bar_balance` | Bull/bear/neutral bar counts + bias (bull/bear/balanced). Bias requires >60% one direction |
+| `intraday.bar_stats` | inside_count, outside_count, outside_pct. outside_pct >15% = very choppy/TR-like |
 | `intraday.micro_channel` | Detected micro channel (active, direction, start_idx, length). Uses Al Brooks definition: bull = each bar's low ≥ prior bar's low |
-| `intraday.patterns[]` | Detected patterns: oo_breakout, ioi, bull/bear_surprise, micro_double_top/bottom |
+| `intraday.patterns[]` | Detected patterns: oo_breakout, ioi, bull/bear_surprise, micro_double_top/bottom. Overlapping DT/DB (same bars) are auto-suppressed as TR noise |
 | `intraday.three_pushes[]` | Detected three-push (wedge) patterns with push bar indices, price levels, and completion status |
 | `intraday.swing_points` | Swing highs and lows (`highs[]`, `lows[]`) with idx and level — use for structure analysis and push counting |
 | `intraday.bars[]` | Today's bars + 5 prior context bars (or all 80 with `--full`). Fields: idx, time, OHLC, volume, body, body_strength, bar_type, upper_tail, lower_tail, close_pct, is_inside, is_outside. EMA20 only attached to today's bars |
@@ -199,8 +204,10 @@ Use the Read tool to look up specific definitions or rules as needed.
 Before entering the tree, collect context from the preprocessor JSON output:
 
 1. **Preprocessor data** — all numeric fields are pre-computed. Read directly from JSON:
-   - Daily: `daily.ema20`, `daily.adr`, `daily.prior_day`, `daily.gap`
+   - Daily: `daily.ema20`, `daily.adr`, `daily.prior_day`, `daily.gap` (includes classification)
    - Intraday: `intraday.baseline_body`, `intraday.ema20_current`, `intraday.today_range`, `intraday.adr_consumed_pct`
+   - EMA health: `intraday.ema20_slope`, `intraday.ema20_distance_pct`, `intraday.ema_crosses_today`
+   - Bar composition: `intraday.bar_balance` (bull/bear/neutral counts + bias), `intraday.bar_stats` (inside/outside counts)
    - Session: `session.current_period`, `session.bars_today`, `session.is_lunch`, `session.minutes_to_close`
    - Bar types and patterns: `intraday.bars[].bar_type`, `intraday.patterns[]`, `intraday.micro_channel`
    - Structure: `intraday.three_pushes[]`, `intraday.swing_points`
@@ -210,8 +217,9 @@ Before entering the tree, collect context from the preprocessor JSON output:
    - Distance from EMA: current price vs `daily.ema20`
    - Prior day character: `daily.prior_day.bar_type`
 
-3. **Gap analysis** (read `daily.gap`):
-   - `|gap.pct_of_adr| > 50%` = large gap = strong breakout signal
+3. **Gap analysis** (read `daily.gap`, includes `classification` field):
+   - `classification == "large"` (>50% ADR) = strong breakout signal
+   - `classification == "medium"` (25-50% ADR) = moderate directional bias
    - Gap + first bar same direction = follow-through → second leg likely
    - Gap + first bar opposite direction = failed breakout → possible reversal
 
@@ -238,6 +246,8 @@ Before entering the tree, collect context from the preprocessor JSON output:
    - **Micro channel**: `intraday.micro_channel` — active, direction, length (Al Brooks definition: bull = every bar's low ≥ prior bar's low)
    - **Three pushes**: `intraday.three_pushes[]` — type, push bar indices, price levels, completion status. Use directly for V7 veto check
    - **Swing points**: `intraday.swing_points` — highs[] and lows[] with idx/level. Use for structure analysis, push counting, and S/R identification
+   - **Bar balance**: `intraday.bar_balance` — bull/bear/neutral counts and bias. Use to confirm trend direction (>60% one side = directional bias)
+   - **Bar stats**: `intraday.bar_stats` — outside_pct >15% signals very choppy, TR-like conditions. Factor into structure classification
 
 ### Layer 1: Data Gate
 
@@ -279,6 +289,7 @@ N2b: Is a trading range breakout in progress?
 │
 └─ NO → STRUCTURE = Trading Range
 │        (≥20 bars oscillating, heavy overlap, no sustained direction)
+│        Also check: `bar_stats.outside_pct > 15%` = very choppy, strongly suggests TR
 │        → proceed to N4
 
 N3: Are pullbacks shallow?
@@ -298,8 +309,14 @@ N4: Is the Always In direction clear?
 │   Check three factors:
 │     ① Direction of most recent strong breakout (highest weight)
 │     ② Direction of most recent micro channel (high weight)
-│     ③ Price above or below EMA (medium weight)
+│     ③ Price above or below EMA (medium weight — but check EMA reliability first)
 │   (Are at least 2 of 3 in agreement?)
+│
+│   EMA reliability check:
+│   → If `ema_crosses_today ≥ 5`: EMA is whipsawing, weight DOWN to low
+│   → If `ema20_slope` near zero (abs < 0.03): EMA is flat, less directional
+│   → Use `bar_balance.bias` as supplementary directional evidence
+│   → Use `ema20_distance_pct` for strength: |distance| > 30% ADR = strong directional signal
 │
 │   When daily and 5-minute directions conflict:
 │   → Note the conflict explicitly
@@ -767,6 +784,9 @@ Internalize these probabilities during analysis. No need to list them every time
 | Bar 1 is not the high/low of the day | ~80% |
 | Big gap down → 60% TR / 20% continuation / 20% reversal | ~60/20/20 |
 | Micro channel 9-10+ bars must pull back | ~90%+ |
+| First hour direction predicts day close direction | ~75-80% |
+| EMA crosses ≥5/day → EMA position unreliable for direction | Backtest-confirmed |
+| Overlapping micro DT + DB on same bars → TR, not directional | Backtest-confirmed |
 | Breakout pullback >66-75% → probably TR or reversal | ~70% |
 | Wedge correction ≈ half the bar count of the wedge | Rule of thumb |
 | Second leg takes more time/bars than first leg | Common |
