@@ -1,26 +1,53 @@
 #!/usr/bin/env python3
 """
-Price Action 数据预处理脚本
+Price Action 数据预处理脚本 v2
 
 用法:
   python preprocess.py "HK.800700"
   python preprocess.py "US.SPY"
+  python preprocess.py "HK.800700" --full   # 输出全部80根bar
 
-自动获取 80根5分钟 + 25根日线，输出富化 JSON:
-  EMA20, bar类型, pattern, micro channel, ADR, gap, session
+v2 变更:
+  - 时区修复: 使用市场时区判定"今日"和交易时段
+  - micro channel: 按Al Brooks原始定义 (bull=low>=prior low)
+  - bar分类优先级: breakout > reversal > inside/outside
+  - surprise检测: 统一overlap计算, 移除过严的gap条件
+  - 新增三推检测 (swing point → three-push)
+  - 新增swing_points输出
+  - 紧凑输出: 默认只输出今日bars + 前日最后5根
+  - EMA20仅附加到今日bars
 """
 import json
 import sys
 import os
 import socket
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 logging.disable(logging.CRITICAL)
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
 
 # ============================================================
 # 市场配置
 # ============================================================
+
+_TZ_NAMES = {"US": "America/New_York", "HK": "Asia/Hong_Kong", "CN": "Asia/Shanghai"}
+# Fallback: fixed UTC offsets (US uses EDT=-4; EST=-5 not auto-detected without zoneinfo)
+_TZ_OFFSETS = {"US": -4, "HK": 8, "CN": 8}
+
+
+def _market_tz(market):
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(_TZ_NAMES.get(market, "America/New_York"))
+        except Exception:
+            pass
+    return timezone(timedelta(hours=_TZ_OFFSETS.get(market, 0)))
+
 
 MARKET_CONFIG = {
     "US": {
@@ -125,7 +152,7 @@ def calc_ema(values, span=20):
 
 
 # ============================================================
-# Bar 分类
+# Bar 分类 (v2: breakout/reversal优先于inside/outside)
 # ============================================================
 
 def classify_bars(bars, baseline_body):
@@ -163,32 +190,20 @@ def classify_bars(bars, baseline_body):
             prev is not None and h > prev["high"] and l < prev["low"]
         )
 
-        b["bar_type"] = _classify_single_bar(b, bar_range, body, baseline_body, upper_tail, lower_tail, close_pct)
+        b["bar_type"] = _classify_single_bar(
+            b, bar_range, body, baseline_body, upper_tail, lower_tail, close_pct
+        )
 
 
 def _classify_single_bar(b, bar_range, body, baseline_body, upper_tail, lower_tail, close_pct):
     if bar_range == 0:
         return "doji"
 
-    if b["is_inside"]:
-        return "inside"
-    if b["is_outside"]:
-        return "outside"
-
-    # Doji: body ≤ 0.3× baseline, neither tail > 2× body
     if baseline_body > 0 and body <= 0.3 * baseline_body:
         if body == 0 or (upper_tail <= 2 * body and lower_tail <= 2 * body):
             return "doji"
 
-    # Bull reversal: close in upper 25%, lower tail ≥ 50%
-    if close_pct >= 75 and lower_tail >= 0.5 * bar_range:
-        return "bull_reversal"
-
-    # Bear reversal: close in lower 25%, upper tail ≥ 50%
-    if close_pct <= 25 and upper_tail >= 0.5 * bar_range:
-        return "bear_reversal"
-
-    # Breakout: large body, close in extreme 10%, small tails
+    # Breakout: highest priority actionable type
     if baseline_body > 0 and body >= 1.5 * baseline_body:
         if upper_tail < 0.25 * bar_range and lower_tail < 0.25 * bar_range:
             if close_pct >= 90:
@@ -196,18 +211,64 @@ def _classify_single_bar(b, bar_range, body, baseline_body, upper_tail, lower_ta
             if close_pct <= 10:
                 return "bear_breakout"
 
-    # Trading range bar: both tails ≥ 33%, close in middle 50%
+    # Reversal: higher priority than structural inside/outside
+    if close_pct >= 75 and lower_tail >= 0.5 * bar_range:
+        return "bull_reversal"
+    if close_pct <= 25 and upper_tail >= 0.5 * bar_range:
+        return "bear_reversal"
+
+    if b["is_inside"]:
+        return "inside"
+    if b["is_outside"]:
+        return "outside"
+
     if (upper_tail >= 0.33 * bar_range and lower_tail >= 0.33 * bar_range
             and 25 <= close_pct <= 75):
         return "tr_bar"
 
-    if b["close"] >= b["open"]:
-        return "bull"
-    return "bear"
+    return "bull" if b["close"] >= b["open"] else "bear"
 
 
 # ============================================================
-# Pattern 检测
+# Swing Point 检测
+# ============================================================
+
+def find_swing_points(bars):
+    """2-bar lookback, adaptive lookahead. Last bar uses lookback only."""
+    n = len(bars)
+    highs, lows = [], []
+
+    for i in range(2, n):
+        left_h = max(bars[i - 1]["high"], bars[i - 2]["high"])
+        left_l = min(bars[i - 1]["low"], bars[i - 2]["low"])
+
+        if i < n - 2:
+            right_h = max(bars[i + 1]["high"], bars[i + 2]["high"])
+            right_l = min(bars[i + 1]["low"], bars[i + 2]["low"])
+        elif i < n - 1:
+            right_h = bars[i + 1]["high"]
+            right_l = bars[i + 1]["low"]
+        else:
+            right_h = bars[i]["high"]
+            right_l = bars[i]["low"]
+
+        if bars[i]["high"] >= left_h and bars[i]["high"] >= right_h:
+            if not highs or i - highs[-1][0] >= 2:
+                highs.append((i, bars[i]["high"]))
+            elif bars[i]["high"] > highs[-1][1]:
+                highs[-1] = (i, bars[i]["high"])
+
+        if bars[i]["low"] <= left_l and bars[i]["low"] <= right_l:
+            if not lows or i - lows[-1][0] >= 2:
+                lows.append((i, bars[i]["low"]))
+            elif bars[i]["low"] < lows[-1][1]:
+                lows[-1] = (i, bars[i]["low"])
+
+    return highs, lows
+
+
+# ============================================================
+# Pattern 检测 (v2: surprise overlap统一计算)
 # ============================================================
 
 def detect_patterns(bars, baseline_body):
@@ -216,51 +277,47 @@ def detect_patterns(bars, baseline_body):
     if n < 3:
         return patterns
 
-    # OO: two consecutive outside bars
     for i in range(1, n):
         if bars[i]["is_outside"] and bars[i - 1]["is_outside"]:
             patterns.append({"type": "oo_breakout", "bars": [i - 1, i]})
 
-    # ioi: inside → outside → inside
     for i in range(2, n):
         if bars[i - 2]["is_inside"] and bars[i - 1]["is_outside"] and bars[i]["is_inside"]:
             patterns.append({"type": "ioi", "bars": [i - 2, i - 1, i]})
 
-    # Bull/Bear Surprise: 2-3 consecutive trend bars, extreme close, minimal overlap, large body
+    # Bull/Bear Surprise: unified overlap calculation
     for length in (3, 2):
         for i in range(length - 1, n):
             start = i - length + 1
             chunk = bars[start:i + 1]
             if baseline_body <= 0:
                 break
-            all_bull = all(b["close"] > b["open"] and b["close_pct"] >= 75
-                          and b["body"] >= baseline_body for b in chunk)
-            all_bear = all(b["close"] < b["open"] and b["close_pct"] <= 25
-                          and b["body"] >= baseline_body for b in chunk)
+            all_bull = all(
+                b["close"] > b["open"] and b["close_pct"] >= 75
+                and b["body"] >= baseline_body for b in chunk
+            )
+            all_bear = all(
+                b["close"] < b["open"] and b["close_pct"] <= 25
+                and b["body"] >= baseline_body for b in chunk
+            )
             if not (all_bull or all_bear):
                 continue
             minimal_overlap = True
             for j in range(1, len(chunk)):
-                if all_bull and chunk[j]["low"] > chunk[j - 1]["close"]:
-                    pass
-                elif all_bear and chunk[j]["high"] < chunk[j - 1]["close"]:
-                    pass
-                elif all_bull and chunk[j]["low"] <= chunk[j - 1]["high"]:
-                    overlap = min(chunk[j]["high"], chunk[j - 1]["high"]) - max(chunk[j]["low"], chunk[j - 1]["low"])
-                    if overlap > 0.5 * max(chunk[j]["body"], chunk[j - 1]["body"]):
+                overlap = (min(chunk[j]["high"], chunk[j - 1]["high"])
+                           - max(chunk[j]["low"], chunk[j - 1]["low"]))
+                if overlap > 0:
+                    max_body = max(chunk[j]["body"], chunk[j - 1]["body"])
+                    if max_body > 0 and overlap > 0.5 * max_body:
                         minimal_overlap = False
-                elif all_bear and chunk[j]["high"] >= chunk[j - 1]["low"]:
-                    overlap = min(chunk[j]["high"], chunk[j - 1]["high"]) - max(chunk[j]["low"], chunk[j - 1]["low"])
-                    if overlap > 0.5 * max(chunk[j]["body"], chunk[j - 1]["body"]):
-                        minimal_overlap = False
+                        break
             if minimal_overlap:
                 direction = "bull_surprise" if all_bull else "bear_surprise"
                 idx_list = list(range(start, i + 1))
-                if not any(p["type"] == direction and set(p["bars"]) & set(idx_list) for p in patterns):
+                if not any(p["type"] == direction and set(p["bars"]) & set(idx_list)
+                           for p in patterns):
                     patterns.append({"type": direction, "bars": idx_list})
 
-    # Micro Double Top/Bottom: two bars within 2-4 bars test same high/low (within 0.1%)
-    # Only scan last 10 bars and deduplicate by level proximity
     scan_start = max(0, n - 10)
     raw_dt, raw_db = [], []
     for i in range(scan_start, n):
@@ -280,11 +337,11 @@ def detect_patterns(bars, baseline_body):
                     "level": round(min(bars[i]["low"], bars[j]["low"]), 4),
                 })
 
-    # Deduplicate: keep only the most recent pair for each distinct level cluster
     for group in (raw_dt, raw_db):
         kept = []
         for p in reversed(group):
-            if not any(abs(p["level"] - k["level"]) / max(p["level"], 1) < 0.002 for k in kept):
+            if not any(abs(p["level"] - k["level"]) / max(p["level"], 1) < 0.002
+                       for k in kept):
                 kept.append(p)
             if len(kept) >= 3:
                 break
@@ -294,73 +351,110 @@ def detect_patterns(bars, baseline_body):
 
 
 # ============================================================
-# Micro Channel 检测
+# Micro Channel 检测 (v2: Al Brooks原始定义)
 # ============================================================
 
 def detect_micro_channel(bars):
+    """
+    Bull: each bar's low >= prior bar's low (no pullback dips below prior bar)
+    Bear: each bar's high <= prior bar's high (no bounce exceeds prior bar)
+    """
     n = len(bars)
     if n < 3:
         return {"active": False}
 
-    best = {"active": False}
+    bull_len = 0
+    for i in range(n - 1, 0, -1):
+        if bars[i]["low"] >= bars[i - 1]["low"]:
+            bull_len += 1
+        else:
+            break
 
-    # Scan from end backwards for the most recent channel
-    for start in range(max(0, n - 20), n - 2):
-        direction = None
-        length = 0
+    bear_len = 0
+    for i in range(n - 1, 0, -1):
+        if bars[i]["high"] <= bars[i - 1]["high"]:
+            bear_len += 1
+        else:
+            break
 
-        for i in range(start + 1, n):
-            if bars[i]["high"] > bars[i - 1]["high"] and bars[i]["low"] >= bars[i - 1]["low"]:
-                if direction is None:
-                    direction = "bull"
-                if direction == "bull":
-                    length += 1
-                else:
-                    break
-            elif bars[i]["low"] < bars[i - 1]["low"] and bars[i]["high"] <= bars[i - 1]["high"]:
-                if direction is None:
-                    direction = "bear"
-                if direction == "bear":
-                    length += 1
-                else:
-                    break
-            else:
-                break
+    if bull_len >= 3 or bear_len >= 3:
+        if bull_len >= bear_len:
+            return {
+                "active": True, "direction": "bull",
+                "start_idx": n - 1 - bull_len, "length": bull_len + 1,
+            }
+        return {
+            "active": True, "direction": "bear",
+            "start_idx": n - 1 - bear_len, "length": bear_len + 1,
+        }
 
-        if length >= 3 and direction is not None:
-            end_idx = start + length
-            if end_idx == n - 1:
-                best = {
-                    "active": True,
-                    "direction": direction,
-                    "start_idx": start,
-                    "length": length + 1,
-                }
+    for look_back in range(min(15, n), 2, -1):
+        start = n - look_back
+        total = look_back - 1
+        hl = sum(1 for i in range(start + 1, n) if bars[i]["low"] >= bars[i - 1]["low"])
+        lh = sum(1 for i in range(start + 1, n) if bars[i]["high"] <= bars[i - 1]["high"])
+        if hl >= total * 0.75:
+            return {"active": True, "direction": "bull", "start_idx": start, "length": look_back}
+        if lh >= total * 0.75:
+            return {"active": True, "direction": "bear", "start_idx": start, "length": look_back}
 
-    if not best["active"]:
-        # Relaxed check: consecutive higher-highs or lower-lows (allowing 1 exception)
-        for look_back in range(min(15, n), 2, -1):
-            start = n - look_back
-            higher = sum(1 for i in range(start + 1, n) if bars[i]["high"] > bars[i - 1]["high"])
-            lower = sum(1 for i in range(start + 1, n) if bars[i]["low"] < bars[i - 1]["low"])
-            total = look_back - 1
-            if higher >= total * 0.75:
-                best = {"active": True, "direction": "bull", "start_idx": start, "length": look_back}
-                break
-            if lower >= total * 0.75:
-                best = {"active": True, "direction": "bear", "start_idx": start, "length": look_back}
-                break
-
-    return best
+    return {"active": False}
 
 
 # ============================================================
-# Session 检测
+# Three-Push 检测 (v2 新增)
+# ============================================================
+
+def detect_three_pushes(bars):
+    n = len(bars)
+    if n < 10:
+        return []
+
+    swing_highs, swing_lows = find_swing_points(bars)
+    results = []
+
+    for i in range(len(swing_lows) - 2):
+        l1, l2, l3 = swing_lows[i], swing_lows[i + 1], swing_lows[i + 2]
+        if l1[1] > l2[1] > l3[1]:
+            if (any(h[0] > l1[0] and h[0] < l2[0] for h in swing_highs)
+                    and any(h[0] > l2[0] and h[0] < l3[0] for h in swing_highs)):
+                results.append({
+                    "type": "bear_three_push",
+                    "pushes": [l1[0], l2[0], l3[0]],
+                    "levels": [round(l1[1], 4), round(l2[1], 4), round(l3[1], 4)],
+                    "complete": l3[0] <= n - 3,
+                })
+
+    for i in range(len(swing_highs) - 2):
+        h1, h2, h3 = swing_highs[i], swing_highs[i + 1], swing_highs[i + 2]
+        if h1[1] < h2[1] < h3[1]:
+            if (any(l[0] > h1[0] and l[0] < h2[0] for l in swing_lows)
+                    and any(l[0] > h2[0] and l[0] < h3[0] for l in swing_lows)):
+                results.append({
+                    "type": "bull_three_push",
+                    "pushes": [h1[0], h2[0], h3[0]],
+                    "levels": [round(h1[1], 4), round(h2[1], 4), round(h3[1], 4)],
+                    "complete": h3[0] <= n - 3,
+                })
+
+    bear = [r for r in results if r["type"] == "bear_three_push"]
+    bull = [r for r in results if r["type"] == "bull_three_push"]
+    final = []
+    if bear:
+        final.append(bear[-1])
+    if bull:
+        final.append(bull[-1])
+    return final
+
+
+# ============================================================
+# Session 检测 (v2: 使用市场时区)
 # ============================================================
 
 def detect_session(market, bars_today_count):
     cfg = MARKET_CONFIG.get(market, MARKET_CONFIG["US"])
-    now = datetime.now()
+    tz = _market_tz(market)
+    now = datetime.now(tz)
 
     close_h, close_m = map(int, cfg["close"].split(":"))
     close_time = now.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
@@ -391,10 +485,25 @@ def detect_session(market, bars_today_count):
 
 
 # ============================================================
+# Today判定 (v2: 使用市场时区)
+# ============================================================
+
+def _today_start_idx(bars, market):
+    if not bars:
+        return 0
+    tz = _market_tz(market)
+    today_str = datetime.now(tz).strftime("%Y-%m-%d")
+    for i, b in enumerate(bars):
+        if b["time"].startswith(today_str):
+            return i
+    return len(bars)
+
+
+# ============================================================
 # 主处理流程
 # ============================================================
 
-def process(code):
+def process(code, full_output=False):
     market = infer_market(code)
 
     host = os.getenv("FUTU_OPEND_HOST", "127.0.0.1")
@@ -419,88 +528,111 @@ def process(code):
     if not bars_5m and not bars_daily:
         return {"error": "未获取到任何K线数据"}
 
-    # --- Daily processing ---
+    # --- Daily ---
     daily_closes = [b["close"] for b in bars_daily]
-    daily_ema20 = calc_ema(daily_closes, 20) if len(daily_closes) >= 1 else []
+    daily_ema20 = calc_ema(daily_closes, 20) if daily_closes else []
 
     daily_ranges = [b["high"] - b["low"] for b in bars_daily]
     adr = round(sum(daily_ranges[-20:]) / len(daily_ranges[-20:]), 4) if daily_ranges else 0
 
     prior_day = None
-    daily_baseline = 0
     if len(bars_daily) >= 2:
         d = bars_daily[-2]
-        daily_baseline = sum(abs(b["close"] - b["open"]) for b in bars_daily[-22:-2]) / max(1, len(bars_daily[-22:-2])) if len(bars_daily) > 2 else abs(d["close"] - d["open"])
-        classify_bars([d], daily_baseline)
+        d_baseline = (
+            sum(abs(b["close"] - b["open"]) for b in bars_daily[-22:-2])
+            / max(1, len(bars_daily[-22:-2]))
+        ) if len(bars_daily) > 2 else abs(d["close"] - d["open"])
+        classify_bars([d], d_baseline)
         prior_day = {
             "high": d["high"], "low": d["low"], "close": d["close"],
             "open": d["open"], "bar_type": d.get("bar_type", ""),
         }
 
-    # Gap: today's first 5m open vs prior day close
+    # Today bars (market-timezone aware)
+    t_start = _today_start_idx(bars_5m, market)
+    today_count = len(bars_5m) - t_start
+
+    # Gap
     gap = {"size": 0, "pct_of_adr": 0}
-    if bars_5m and prior_day:
-        today_bars = _get_today_bars(bars_5m)
-        if today_bars:
-            gap_size = round(today_bars[0]["open"] - prior_day["close"], 4)
-            gap["size"] = gap_size
-            gap["pct_of_adr"] = round(gap_size / adr * 100, 2) if adr > 0 else 0
+    if prior_day and today_count > 0:
+        gap_size = round(bars_5m[t_start]["open"] - prior_day["close"], 4)
+        gap["size"] = gap_size
+        gap["pct_of_adr"] = round(gap_size / adr * 100, 2) if adr else 0
 
-    daily_section = {
-        "ema20": round(daily_ema20[-1], 4) if daily_ema20 else None,
-        "adr": adr,
-        "prior_day": prior_day,
-        "gap": gap,
-    }
-
-    # --- Intraday processing ---
-    today_bars = _get_today_bars(bars_5m)
-    work_bars = today_bars if len(today_bars) >= 3 else bars_5m[-30:] if bars_5m else []
-
+    # --- Intraday ---
     closes_5m = [b["close"] for b in bars_5m]
-    ema20_5m = calc_ema(closes_5m, 20) if len(closes_5m) >= 1 else []
+    ema20_5m = calc_ema(closes_5m, 20) if closes_5m else []
 
     recent_bodies = [abs(b["close"] - b["open"]) for b in bars_5m[-20:]] if bars_5m else []
     baseline_body = round(sum(recent_bodies) / len(recent_bodies), 4) if recent_bodies else 0
 
     classify_bars(bars_5m, baseline_body)
 
-    # Attach EMA20 to each bar
     for i, b in enumerate(bars_5m):
         b["ema20"] = round(ema20_5m[i], 4) if i < len(ema20_5m) else None
 
-    # Today's range
-    if today_bars:
-        today_high = max(b["high"] for b in today_bars)
-        today_low = min(b["low"] for b in today_bars)
+    # Today range
+    if today_count > 0:
+        today_high = max(b["high"] for b in bars_5m[t_start:])
+        today_low = min(b["low"] for b in bars_5m[t_start:])
     else:
         today_high = today_low = 0
-    today_range_val = today_high - today_low
-    adr_consumed_pct = round(today_range_val / adr * 100, 2) if adr > 0 else 0
+    adr_consumed_pct = round((today_high - today_low) / adr * 100, 2) if adr else 0
 
-    # Patterns (scan last 20 bars)
-    scan_bars = bars_5m[-20:] if len(bars_5m) >= 20 else bars_5m
-    patterns = detect_patterns(scan_bars, baseline_body)
-    # Remap pattern bar indices to global indices
-    offset = len(bars_5m) - len(scan_bars)
+    # Patterns (last 20 bars)
+    scan_n = min(20, len(bars_5m))
+    scan_offset = len(bars_5m) - scan_n
+    patterns = detect_patterns(bars_5m[-scan_n:], baseline_body)
     for p in patterns:
-        p["bars"] = [idx + offset for idx in p["bars"]]
-        if "level" in p:
-            p["level"] = round(p["level"], 4)
+        p["bars"] = [idx + scan_offset for idx in p["bars"]]
 
-    micro_ch = detect_micro_channel(bars_5m[-20:] if len(bars_5m) >= 20 else bars_5m)
+    # Micro channel (last 20 bars)
+    mc_n = min(20, len(bars_5m))
+    mc_offset = len(bars_5m) - mc_n
+    micro_ch = detect_micro_channel(bars_5m[-mc_n:])
     if micro_ch.get("active") and "start_idx" in micro_ch:
-        micro_ch["start_idx"] += offset
+        micro_ch["start_idx"] += mc_offset
 
-    # Build enriched bar output (last 80 bars with all computed fields)
-    enriched_bars = []
-    for i, b in enumerate(bars_5m):
-        enriched_bars.append({
+    # Three-push (today's bars if sufficient, else last 40)
+    if today_count >= 10:
+        tp_slice = bars_5m[t_start:]
+        tp_offset = t_start
+    else:
+        tp_n = min(40, len(bars_5m))
+        tp_slice = bars_5m[-tp_n:]
+        tp_offset = len(bars_5m) - tp_n
+    three_pushes = detect_three_pushes(tp_slice)
+    for tp in three_pushes:
+        tp["pushes"] = [idx + tp_offset for idx in tp["pushes"]]
+
+    # Swing points (today's bars if sufficient, else last 30)
+    if today_count >= 5:
+        sp_slice = bars_5m[t_start:]
+        sp_offset = t_start
+    else:
+        sp_n = min(30, len(bars_5m))
+        sp_slice = bars_5m[-sp_n:]
+        sp_offset = len(bars_5m) - sp_n
+    sp_highs, sp_lows = find_swing_points(sp_slice)
+    swing_points = {
+        "highs": [{"idx": idx + sp_offset, "level": round(v, 4)} for idx, v in sp_highs],
+        "lows": [{"idx": idx + sp_offset, "level": round(v, 4)} for idx, v in sp_lows],
+    }
+
+    # --- Build output bars (compact by default) ---
+    if full_output:
+        out_start = 0
+    else:
+        out_start = max(0, t_start - 5)
+
+    enriched = []
+    for i in range(out_start, len(bars_5m)):
+        b = bars_5m[i]
+        entry = {
             "idx": i,
             "time": b["time"],
             "o": b["open"], "h": b["high"], "l": b["low"], "c": b["close"],
             "volume": b["volume"],
-            "ema20": b.get("ema20"),
             "body": b["body"],
             "body_strength": b.get("body_strength", "normal"),
             "bar_type": b.get("bar_type", ""),
@@ -509,15 +641,23 @@ def process(code):
             "close_pct": b["close_pct"],
             "is_inside": b["is_inside"],
             "is_outside": b["is_outside"],
-        })
+        }
+        if i >= t_start:
+            entry["ema20"] = b.get("ema20")
+        enriched.append(entry)
 
-    session = detect_session(market, len(today_bars))
+    session = detect_session(market, today_count)
 
     return {
         "code": code,
         "market": market,
         "session": session,
-        "daily": daily_section,
+        "daily": {
+            "ema20": round(daily_ema20[-1], 4) if daily_ema20 else None,
+            "adr": adr,
+            "prior_day": prior_day,
+            "gap": gap,
+        },
         "intraday": {
             "baseline_body": baseline_body,
             "ema20_current": round(ema20_5m[-1], 4) if ema20_5m else None,
@@ -525,16 +665,11 @@ def process(code):
             "adr_consumed_pct": adr_consumed_pct,
             "micro_channel": micro_ch,
             "patterns": patterns,
-            "bars": enriched_bars,
+            "three_pushes": three_pushes,
+            "swing_points": swing_points,
+            "bars": enriched,
         },
     }
-
-
-def _get_today_bars(bars):
-    if not bars:
-        return []
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    return [b for b in bars if b["time"].startswith(today_str)]
 
 
 # ============================================================
@@ -543,11 +678,12 @@ def _get_today_bars(bars):
 
 def main():
     if len(sys.argv) < 2:
-        print(json.dumps({"error": "用法: preprocess.py CODE"}, ensure_ascii=False))
+        print(json.dumps({"error": "用法: preprocess.py CODE [--full]"}, ensure_ascii=False))
         sys.exit(1)
 
     code = sys.argv[1]
-    result = process(code)
+    full = "--full" in sys.argv
+    result = process(code, full_output=full)
     print(json.dumps(result, ensure_ascii=False))
 
 

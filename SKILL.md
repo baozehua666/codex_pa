@@ -9,7 +9,7 @@ description: >-
   and analyzes per the Al Brooks decision framework with weighted veto scoring.
   Supports market-aware session detection (HK/CN lunch break, afternoon open).
   Does not push unsolicited — responds only when asked.
-allowed-tools: Bash Read
+allowed-tools: Bash PowerShell Read
 ---
 
 # Al Brooks Price Action Analysis Skill
@@ -127,6 +127,7 @@ Futu code format:
 **Performance notes:**
 - First call of a new symbol takes ~4-7s (OpenD preparing data)
 - Subsequent calls for the same symbol: ~1.8s (subscription cached)
+- Use `--full` flag to output all 80 bars (default: compact — today's bars + prior day's last 5)
 
 ### Preprocessor Output
 
@@ -135,7 +136,7 @@ The script returns a single JSON object with **all data pre-computed**:
 | Field | Description |
 |-------|-------------|
 | `code`, `market` | Symbol and detected market (US/HK/CN) |
-| `session.current_period` | Current trading period (opening/morning/lunch/afternoon_open/afternoon/closing/closed) |
+| `session.current_period` | Current trading period (opening/morning/lunch/afternoon_open/afternoon/closing/closed). Uses market timezone (not local system clock) |
 | `session.bars_today` | Number of 5-min bars for today |
 | `session.is_lunch` | Whether market is in lunch break (HK/CN only) |
 | `session.minutes_to_close` | Minutes remaining to market close |
@@ -147,11 +148,13 @@ The script returns a single JSON object with **all data pre-computed**:
 | `intraday.ema20_current` | Current 5-min EMA20 value |
 | `intraday.today_range` | Today's high/low |
 | `intraday.adr_consumed_pct` | Today's range as % of ADR |
-| `intraday.micro_channel` | Detected micro channel (active, direction, start_idx, length) |
+| `intraday.micro_channel` | Detected micro channel (active, direction, start_idx, length). Uses Al Brooks definition: bull = each bar's low ≥ prior bar's low |
 | `intraday.patterns[]` | Detected patterns: oo_breakout, ioi, bull/bear_surprise, micro_double_top/bottom |
-| `intraday.bars[]` | All 80 bars with: idx, time, OHLC, ema20, body, body_strength, bar_type, upper_tail, lower_tail, close_pct, is_inside, is_outside |
+| `intraday.three_pushes[]` | Detected three-push (wedge) patterns with push bar indices, price levels, and completion status |
+| `intraday.swing_points` | Swing highs and lows (`highs[]`, `lows[]`) with idx and level — use for structure analysis and push counting |
+| `intraday.bars[]` | Today's bars + 5 prior context bars (or all 80 with `--full`). Fields: idx, time, OHLC, volume, body, body_strength, bar_type, upper_tail, lower_tail, close_pct, is_inside, is_outside. EMA20 only attached to today's bars |
 
-**Bar types (pre-classified):** bull_reversal, bear_reversal, bull_breakout, bear_breakout, doji, inside, outside, tr_bar, bull, bear
+**Bar type priority (v2):** breakout > reversal > inside/outside > tr_bar > bull/bear. An outside bar with clear reversal characteristics is classified as reversal (is_outside flag still set).
 
 **Body strength:** large (≥1.5× baseline), normal, small (≤0.5× baseline)
 
@@ -200,6 +203,7 @@ Before entering the tree, collect context from the preprocessor JSON output:
    - Intraday: `intraday.baseline_body`, `intraday.ema20_current`, `intraday.today_range`, `intraday.adr_consumed_pct`
    - Session: `session.current_period`, `session.bars_today`, `session.is_lunch`, `session.minutes_to_close`
    - Bar types and patterns: `intraday.bars[].bar_type`, `intraday.patterns[]`, `intraday.micro_channel`
+   - Structure: `intraday.three_pushes[]`, `intraday.swing_points`
 
 2. **Daily chart context** (interpret from pre-computed data):
    - Trend direction: compare recent daily bars' close vs `daily.ema20`
@@ -228,10 +232,12 @@ Before entering the tree, collect context from the preprocessor JSON output:
 7. **Opening reversal check** (first 60–90 min only): if price has made a fast move toward a magnet since open, flag as potential Opening Reversal setup
 
 8. **Pre-computed references** (already in JSON, use directly):
-   - **Bar types**: each bar's `bar_type` field (bull_reversal / bear_reversal / bull_breakout / bear_breakout / doji / inside / outside / tr_bar / bull / bear)
+   - **Bar types**: each bar's `bar_type` field (bull_reversal / bear_reversal / bull_breakout / bear_breakout / doji / inside / outside / tr_bar / bull / bear). Note: breakout/reversal takes priority over inside/outside — check `is_inside`/`is_outside` flags for structural info
    - **Body strength**: each bar's `body_strength` (large / normal / small)
    - **Patterns detected**: `intraday.patterns[]` — oo_breakout, ioi, bull_surprise, bear_surprise, micro_double_top, micro_double_bottom
-   - **Micro channel**: `intraday.micro_channel` — active, direction, length
+   - **Micro channel**: `intraday.micro_channel` — active, direction, length (Al Brooks definition: bull = every bar's low ≥ prior bar's low)
+   - **Three pushes**: `intraday.three_pushes[]` — type, push bar indices, price levels, completion status. Use directly for V7 veto check
+   - **Swing points**: `intraday.swing_points` — highs[] and lows[] with idx/level. Use for structure analysis, push counting, and S/R identification
 
 ### Layer 1: Data Gate
 
@@ -314,8 +320,9 @@ N4: Is the Always In direction clear?
 |--------|-------|--------|-----------|
 | Critical | 5 | V1 (counter-trend tight channel), V2 (middle of TR) | Brad's strongest "don't trade" signals |
 | Major | 3 | V3 (counter S/R), V4 (stop too large), V5 (chasing big bar), V6 (micro channel 1st reversal), V8 (far from EMA counter-trend), V10 (deep pullback) | Important but not absolute |
-| Moderate | 2 | V7 (4th leg after 3 pushes) | Structural concern |
-| Minor | 1 | V9 (ADR >80%), V11 (micro channel 9+ bars), V12 (unfavorable period) | Cumulative concerns |
+| Moderate | 2 | V7 (4th leg after 3 pushes), V13 (consecutive breakout bars = climactic) | Structural concern / exhaustion |
+| Graded | 1–3 | V9 (ADR consumed: 80–90%→1, 90–100%→2, >100%→3) | Progressive ADR exhaustion |
+| Minor | 1 | V11 (micro channel 9+ bars), V12 (unfavorable period) | Cumulative concerns |
 
 #### Scoring Thresholds
 
@@ -346,12 +353,14 @@ V5 [3分]: Is this chasing after a big bar or big gap without pullback?
 V6 [3分]: Is this the first reversal of a micro channel?
          (Check intraday.micro_channel — if active and direction opposes trade direction)
 V7 [2分]: Have three pushes completed and this is a 4th leg entry?
+         (Check intraday.three_pushes[] — if any entry has complete=true)
          Also check: is a Final Flag forming? If confirmed, counter-trend entry
          with ~40% swing probability and TBTL minimum target.
 V8 [3分]: Is price far from EMA and this is a counter-trend trade?
          (Compare current price vs intraday.ema20_current)
-V9 [1分]: Has >80% of the ADR been consumed today?
+V9 [1-3分]: Has a significant portion of the ADR been consumed today?
          (Read intraday.adr_consumed_pct directly)
+         80–90% → 1分, 90–100% → 2分, >100% → 3分
 V10 [3分]: Is the breakout pullback depth >75%?
 V11 [1分]: Is this chasing a micro channel that has lasted ≥9 bars?
           (Check intraday.micro_channel.length ≥ 9)
@@ -362,6 +371,10 @@ V12 [1分]: Is the current period unfavorable?
           - "lunch" → 午休时段，信号可靠性降低（HK/CN）
           - "afternoon_open" → 午后开盘，方向可能变化（HK/CN）
           - Other periods → no penalty
+V13 [2分]: Are there 2+ consecutive same-direction breakout bars (climactic)?
+          (Check last 2-3 bars: all bull_breakout or all bear_breakout bar_type)
+          Consecutive breakout bars signal momentum exhaustion, not continuation.
+          Applies to both with-trend entries (chasing climax) and counter-trend (too early).
 ```
 
 ### Layer 5: Signal Quality Gates
