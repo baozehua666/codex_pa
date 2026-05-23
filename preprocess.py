@@ -14,7 +14,7 @@ v2 变更:
   - surprise检测: 统一overlap计算, 移除过严的gap条件
   - 新增三推检测 (swing point → three-push)
   - 新增swing_points输出
-  - 紧凑输出: 默认只输出今日bars + 前日最后5根
+  - 紧凑输出: 默认输出今日bars + 足够引用已检测形态的前文
   - EMA20仅附加到今日bars
 """
 import json
@@ -373,40 +373,31 @@ def detect_micro_channel(bars):
     if n < 3:
         return {"active": False}
 
-    bull_len = 0
+    bull_pairs = 0
     for i in range(n - 1, 0, -1):
         if bars[i]["low"] >= bars[i - 1]["low"]:
-            bull_len += 1
+            bull_pairs += 1
         else:
             break
 
-    bear_len = 0
+    bear_pairs = 0
     for i in range(n - 1, 0, -1):
         if bars[i]["high"] <= bars[i - 1]["high"]:
-            bear_len += 1
+            bear_pairs += 1
         else:
             break
 
-    if bull_len >= 3 or bear_len >= 3:
-        if bull_len >= bear_len:
+    min_pairs = 2  # 3 bars in sequence.
+    if bull_pairs >= min_pairs or bear_pairs >= min_pairs:
+        if bull_pairs >= bear_pairs:
             return {
                 "active": True, "direction": "bull",
-                "start_idx": n - 1 - bull_len, "length": bull_len + 1,
+                "start_idx": n - 1 - bull_pairs, "length": bull_pairs + 1,
             }
         return {
             "active": True, "direction": "bear",
-            "start_idx": n - 1 - bear_len, "length": bear_len + 1,
+            "start_idx": n - 1 - bear_pairs, "length": bear_pairs + 1,
         }
-
-    for look_back in range(min(15, n), 2, -1):
-        start = n - look_back
-        total = look_back - 1
-        hl = sum(1 for i in range(start + 1, n) if bars[i]["low"] >= bars[i - 1]["low"])
-        lh = sum(1 for i in range(start + 1, n) if bars[i]["high"] <= bars[i - 1]["high"])
-        if hl >= total * 0.75:
-            return {"active": True, "direction": "bull", "start_idx": start, "length": look_back}
-        if lh >= total * 0.75:
-            return {"active": True, "direction": "bear", "start_idx": start, "length": look_back}
 
     return {"active": False}
 
@@ -465,6 +456,14 @@ def detect_session(market, bars_today_count):
     cfg = MARKET_CONFIG.get(market, MARKET_CONFIG["US"])
     tz = _market_tz(market)
     now = datetime.now(tz)
+
+    if now.weekday() >= 5:
+        return {
+            "current_period": "closed",
+            "bars_today": bars_today_count,
+            "is_lunch": False,
+            "minutes_to_close": 0,
+        }
 
     close_h, close_m = map(int, cfg["close"].split(":"))
     close_time = now.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
@@ -684,7 +683,8 @@ def process(code, full_output=False):
     if full_output:
         out_start = 0
     else:
-        out_start = max(0, t_start - 5)
+        referenced_starts = [max(0, t_start - 5), scan_offset, mc_offset, tp_offset, sp_offset]
+        out_start = max(0, min(referenced_starts))
 
     enriched = []
     for i in range(out_start, len(bars_5m)):
