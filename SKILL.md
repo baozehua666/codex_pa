@@ -98,7 +98,7 @@ Follow this order strictly. The sequence is the edge.
    | V11 | 1 | Chasing a 9+ bar micro channel |
    | V12 | 1 | Opening, afternoon open, closing, or just after lunch |
    | V13 | 2 | Consecutive breakout bars likely climactic |
-   | V14 | 3 | Bad stop-order signal: poor signal bar at S/R, likely better for opposite limit traders |
+   | V14 | 3 | Bad stop-order signal: poor signal bar at S/R, or broad-channel micro DT/DB not at the correct edge |
    | V15 | 2 | Narrow trading range where stop-order entries cannot reach reward/risk |
 
    Always show one line:
@@ -113,6 +113,7 @@ Follow this order strictly. The sequence is the edge.
    - A small signal bar can have good risk/reward but low probability. Do not call it high confidence unless context is strong.
    - A big signal bar can have higher probability but worse risk/reward. Size down or wait for pullback.
    - In a trading range, stop-order entries in the middle are bad; prefer failed breakouts at edges or wait.
+   - In a broad channel, micro double top/bottom is valid only near the correct channel edge, range edge, or clear S/R magnet; wrong-edge or middle micro DT/DB is a weak stop-order trap, not a standalone entry.
 
 6. **Risk, route, and management**
    - Stop = signal bar extreme or structural invalidation point; use the trading timeframe only.
@@ -121,6 +122,7 @@ Follow this order strictly. The sequence is the edge.
    - Trend/tight channel: with-trend swing plan; partial at 1R, trail behind important pullback highs/lows.
    - Trading range: scalp plan only at edges; quick profit, wider stop only with reduced size.
    - Do not convert a losing scalp into a swing. If trapped in a trend, stop out; if trapped in a range, scale-in only when total risk remains normal.
+   - After a stop-out, wait at least two bars or a fresh strong breakout/follow-through before reversing; do not immediately flip inside the same small structure.
 
 ## Opening Rules
 

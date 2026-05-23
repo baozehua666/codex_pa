@@ -597,6 +597,12 @@ def score_vetoes(snap, structure, direction, signal):
             vetoes.append(("V3", 3, "宽通道买在高位"))
         if direction == "short" and pos < 0.35:
             vetoes.append(("V3", 3, "宽通道卖在低位"))
+        if signal.get("valid"):
+            reason = signal.get("reason", "")
+            if direction == "long" and "微型双底" in reason and pos > 0.45:
+                vetoes.append(("V14", 3, "宽通道非下沿微型双底"))
+            if direction == "short" and "微型双顶" in reason and pos < 0.55:
+                vetoes.append(("V14", 3, "宽通道非上沿微型双顶"))
     else:
         if direction == "long" and pos > 0.82:
             vetoes.append(("V3", 3, "买在阻力"))
@@ -726,6 +732,17 @@ def watch(snap, structure, path, reason, veto_line=None, direction="none"):
     }
 
 
+def cooldown_watch(decision, cooldown_until):
+    blocked = {**decision}
+    blocked["advice"] = "观望"
+    blocked["confidence"] = "弱"
+    blocked["path"] = "M1✗"
+    blocked["reason"] = f"止损后冷却，等待第{cooldown_until + 1}根K线后再评估"
+    blocked["veto_line"] = "> 管理规则: 止损后两根K线内不反手 -> 观望"
+    blocked["order"] = None
+    return blocked
+
+
 def format_veto(vetoes, score):
     if not vetoes:
         return "> 否决评分: 0分 -> 全部通过"
@@ -747,6 +764,7 @@ def run_backtest(args, daily, five):
         day_stats[date] = {"bars": len(day_bars), "signals": 0, "trades": 0, "r": 0.0}
         pending = None
         position = None
+        cooldown_until = 0
 
         for day_idx, _ in enumerate(day_bars, start=1):
             snap = process_snapshot(args.code, daily, five, date, day_idx)
@@ -774,13 +792,19 @@ def run_backtest(args, daily, five):
                     day_stats[date]["trades"] += 1
                     day_stats[date]["r"] += trade.r
                     event = f"出场 {trade.outcome} {trade.r:.2f}R"
+                    if "止损" in trade.outcome:
+                        cooldown_until = day_idx + 2
                     position = None
 
             decision = analyze_snapshot(snap)
             if decision["order"] and not pending and not position:
-                pending = decision["order"]
-                day_stats[date]["signals"] += 1
-                event = event or "发出挂单"
+                if day_idx <= cooldown_until:
+                    decision = cooldown_watch(decision, cooldown_until)
+                    event = event or "止损后冷却"
+                else:
+                    pending = decision["order"]
+                    day_stats[date]["signals"] += 1
+                    event = event or "发出挂单"
             monitor.append({**decision, "event": event, "date": date})
 
         if position:
@@ -1013,7 +1037,7 @@ def render_html(args, metadata, daily, five, monitor, trades, day_stats, out_pat
     </div>
     <section>
       <h2>修正版规则</h2>
-      <p class="note">震荡区间只在上下沿做反转，不在中部追突破；宽通道避免在高位追多或低位追空；微型双顶/双底和意外强势必须由当前K线方向确认；趋势/通道用顺势 stop entry；成交后按实际入场价重新校验风险和盈亏比；到 +1R 后半仓止盈并把剩余仓位止损移到保本；同根K线止损与目标同时出现时按保守顺序处理；不隔夜。</p>
+      <p class="note">震荡区间只在上下沿做反转，不在中部追突破；宽通道避免在高位追多或低位追空，非正确边缘的微型双顶/双底必须有清晰支撑阻力或放弃；止损后至少冷却两根K线；微型双顶/双底和意外强势必须由当前K线方向确认；趋势/通道用顺势 stop entry；成交后按实际入场价重新校验风险和盈亏比；到 +1R 后半仓止盈并把剩余仓位止损移到保本；同根K线止损与目标同时出现时按保守顺序处理；不隔夜。</p>
     </section>
     <section>
       <h2>交易明细</h2>
