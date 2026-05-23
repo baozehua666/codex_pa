@@ -16,6 +16,7 @@ v2 变更:
   - 新增swing_points输出
   - 紧凑输出: 默认输出今日bars + 足够引用已检测形态的前文
   - EMA20仅附加到今日bars
+  - 信号形态/微通道/三推仅用今日K线，避免早盘跨隔夜误判
 """
 import json
 import sys
@@ -544,22 +545,26 @@ def process(code, full_output=False):
     daily_ranges = [b["high"] - b["low"] for b in bars_daily]
     adr = round(sum(daily_ranges[-20:]) / len(daily_ranges[-20:]), 4) if daily_ranges else 0
 
+    # Today bars (market-timezone aware)
+    t_start = _today_start_idx(bars_5m, market)
+    today_count = len(bars_5m) - t_start
+    today_date = bars_5m[t_start]["time"][:10] if today_count > 0 else None
+
     prior_day = None
-    if len(bars_daily) >= 2:
-        d = bars_daily[-2]
+    if bars_daily:
+        latest_daily_is_today = bool(today_date and bars_daily[-1]["time"].startswith(today_date))
+        prior_idx = -2 if latest_daily_is_today and len(bars_daily) >= 2 else -1
+        d = bars_daily[prior_idx]
+        baseline_end = len(bars_daily) + prior_idx
+        baseline_slice = bars_daily[max(0, baseline_end - 20):baseline_end]
         d_baseline = (
-            sum(abs(b["close"] - b["open"]) for b in bars_daily[-22:-2])
-            / max(1, len(bars_daily[-22:-2]))
-        ) if len(bars_daily) > 2 else abs(d["close"] - d["open"])
+            sum(abs(b["close"] - b["open"]) for b in baseline_slice) / len(baseline_slice)
+        ) if baseline_slice else abs(d["close"] - d["open"])
         classify_bars([d], d_baseline)
         prior_day = {
             "high": d["high"], "low": d["low"], "close": d["close"],
             "open": d["open"], "bar_type": d.get("bar_type", ""),
         }
-
-    # Today bars (market-timezone aware)
-    t_start = _today_start_idx(bars_5m, market)
-    today_count = len(bars_5m) - t_start
 
     # Gap
     gap = {"size": 0, "pct_of_adr": 0, "classification": "none"}
@@ -587,37 +592,67 @@ def process(code, full_output=False):
 
     # Today range
     if today_count > 0:
-        today_high = max(b["high"] for b in bars_5m[t_start:])
-        today_low = min(b["low"] for b in bars_5m[t_start:])
+        today_bars = bars_5m[t_start:]
+        today_high = max(b["high"] for b in today_bars)
+        today_low = min(b["low"] for b in today_bars)
     else:
+        today_bars = []
         today_high = today_low = 0
+    today_range = today_high - today_low
+    range_position = (
+        round((bars_5m[-1]["close"] - today_low) / today_range, 3)
+        if today_count > 0 and today_range > 0
+        else None
+    )
     adr_consumed_pct = round((today_high - today_low) / adr * 100, 2) if adr else 0
 
-    # Patterns (last 20 bars)
-    scan_n = min(20, len(bars_5m))
-    scan_offset = len(bars_5m) - scan_n
-    patterns = detect_patterns(bars_5m[-scan_n:], baseline_body)
+    # Signal patterns: today's bars only. Prior-day bars are context, not live signals.
+    scan_n = min(20, len(today_bars))
+    scan_offset = t_start + len(today_bars) - scan_n if scan_n else len(bars_5m)
+    patterns = detect_patterns(today_bars[-scan_n:], baseline_body) if scan_n >= 3 else []
     for p in patterns:
         p["bars"] = [idx + scan_offset for idx in p["bars"]]
 
-    # Micro channel (last 20 bars)
-    mc_n = min(20, len(bars_5m))
-    mc_offset = len(bars_5m) - mc_n
-    micro_ch = detect_micro_channel(bars_5m[-mc_n:])
+    # Micro channel: today's bars only, otherwise early-session output can inherit yesterday.
+    mc_n = min(20, len(today_bars))
+    mc_offset = t_start + len(today_bars) - mc_n if mc_n else len(bars_5m)
+    micro_ch = detect_micro_channel(today_bars[-mc_n:]) if mc_n >= 3 else {"active": False}
     if micro_ch.get("active") and "start_idx" in micro_ch:
         micro_ch["start_idx"] += mc_offset
 
-    # Three-push (today's bars if sufficient, else last 40)
+    # Three-push: do not bridge overnight.
     if today_count >= 10:
-        tp_slice = bars_5m[t_start:]
+        tp_slice = today_bars
         tp_offset = t_start
+        three_pushes = detect_three_pushes(tp_slice)
     else:
-        tp_n = min(40, len(bars_5m))
-        tp_slice = bars_5m[-tp_n:]
-        tp_offset = len(bars_5m) - tp_n
-    three_pushes = detect_three_pushes(tp_slice)
+        tp_offset = t_start if today_count > 0 else len(bars_5m)
+        three_pushes = []
     for tp in three_pushes:
         tp["pushes"] = [idx + tp_offset for idx in tp["pushes"]]
+
+    def opening_range(first_n):
+        if today_count < first_n:
+            return {"complete": False}
+        chunk = today_bars[:first_n]
+        hi = max(b["high"] for b in chunk)
+        lo = min(b["low"] for b in chunk)
+        width = hi - lo
+        close = bars_5m[-1]["close"]
+        if close > hi:
+            state = "above"
+        elif close < lo:
+            state = "below"
+        else:
+            state = "inside"
+        return {
+            "complete": True,
+            "high": round(hi, 4),
+            "low": round(lo, 4),
+            "width": round(width, 4),
+            "position": round((close - lo) / width, 3) if width > 0 else None,
+            "state": state,
+        }
 
     # Swing points (today's bars if sufficient, else last 30)
     if today_count >= 5:
@@ -726,6 +761,11 @@ def process(code, full_output=False):
             "ema20_distance_pct": ema_distance_pct,
             "ema_crosses_today": ema_crosses_today,
             "today_range": {"high": round(today_high, 4), "low": round(today_low, 4)},
+            "range_position": range_position,
+            "opening_range": {
+                "first_30m": opening_range(6),
+                "first_90m": opening_range(18),
+            },
             "adr_consumed_pct": adr_consumed_pct,
             "bar_balance": bar_balance,
             "bar_stats": bar_stats,
