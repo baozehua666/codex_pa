@@ -29,6 +29,18 @@ TICK = 0.01
 
 
 @dataclass
+class InstrumentSpec:
+    profile: str
+    contracts: int
+    tick_size: float
+    point_value: float
+    commission_rt: float
+    slippage_ticks: float
+    scale_out: bool
+    currency: str = "USD"
+
+
+@dataclass
 class PendingOrder:
     direction: str
     order_type: str
@@ -43,6 +55,9 @@ class PendingOrder:
     reason: str
     veto_line: str
     expires_day_idx: int
+    signal_period: str
+    adr_pct: float
+    range_position: float
 
 
 @dataclass
@@ -60,7 +75,12 @@ class Position:
     reason: str
     veto_line: str
     signal_time: str
+    signal_period: str
+    adr_pct: float
+    range_position: float
+    scale_out: bool = True
     partial_taken: bool = False
+    breakeven_moved: bool = False
     realized_r: float = 0.0
     size_left: float = 1.0
 
@@ -83,6 +103,16 @@ class Trade:
     confidence: str
     reason: str
     veto_line: str
+    signal_period: str = ""
+    adr_pct: float = 0.0
+    range_position: float = 0.0
+    gross_r: float = 0.0
+    net_r: float = 0.0
+    risk_dollars: float = 0.0
+    gross_pnl: float = 0.0
+    net_pnl: float = 0.0
+    commission: float = 0.0
+    slippage_cost: float = 0.0
 
 
 def parse_args():
@@ -91,6 +121,7 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   python tools/price_action_backtester.py --code US.SPY --start 2026-05-18 --end 2026-05-22
+  python tools/price_action_backtester.py --code US.ESmain --profile es --start 2026-05-18 --end 2026-05-22
   python tools/price_action_backtester.py --code HK.800000 --start 2026-05-18 --end 2026-05-22 --refresh
   python tools/price_action_backtester.py --code US.QQQ --start 2026-05-01 --end 2026-05-22 --output reports/qqq.html
 """,
@@ -103,9 +134,57 @@ def parse_args():
     parser.add_argument("--output", default=None, help="HTML output path")
     parser.add_argument("--cache-dir", default="backtest_cache", help="K-line cache directory")
     parser.add_argument("--refresh", action="store_true", help="Ignore cache and fetch from Futu OpenD")
+    parser.add_argument("--profile", choices=("auto", "stock", "es", "mes"), default="auto", help="Instrument cost/contract profile")
+    parser.add_argument("--contracts", type=int, default=None, help="Number of contracts/shares for P&L reporting; ES default is 1")
+    parser.add_argument("--tick-size", type=float, default=None, help="Override minimum tick size")
+    parser.add_argument("--point-value", type=float, default=None, help="Dollar value per 1.0 point per contract")
+    parser.add_argument("--commission-rt", type=float, default=None, help="Round-turn commission/fees per contract in dollars")
+    parser.add_argument("--slippage-ticks", type=float, default=None, help="Assumed one-way slippage in ticks per fill")
+    parser.add_argument("--scale-out", choices=("auto", "yes", "no"), default="auto", help="Use +1R half scale-out. ES one-contract defaults to no")
+    parser.add_argument("--session", choices=("rth", "all"), default="rth", help="Use regular trading hours only, or all bars")
     parser.add_argument("--host", default=os.getenv("FUTU_OPEND_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.getenv("FUTU_OPEND_PORT", "11111")))
     return parser.parse_args()
+
+
+def resolve_instrument(args):
+    profile = getattr(args, "profile", "auto")
+    if profile == "auto":
+        code = args.code.upper()
+        profile = "mes" if "MESMAIN" in code or code.startswith("MES") else "es" if "ESMAIN" in code or code.startswith("ES") else "stock"
+
+    defaults = {
+        "stock": {"contracts": 1, "tick_size": 0.01, "point_value": 1.0, "commission_rt": 0.0, "slippage_ticks": 0.0},
+        "es": {"contracts": 1, "tick_size": 0.25, "point_value": 50.0, "commission_rt": 4.50, "slippage_ticks": 1.0},
+        "mes": {"contracts": 1, "tick_size": 0.25, "point_value": 5.0, "commission_rt": 1.50, "slippage_ticks": 1.0},
+    }[profile]
+
+    contracts_arg = getattr(args, "contracts", None)
+    scale_out_arg = getattr(args, "scale_out", "auto")
+    contracts = contracts_arg if contracts_arg is not None else defaults["contracts"]
+    if scale_out_arg == "yes":
+        scale_out = True
+    elif scale_out_arg == "no":
+        scale_out = False
+    else:
+        scale_out = profile == "stock" or contracts >= 2
+
+    return InstrumentSpec(
+        profile=profile,
+        contracts=contracts,
+        tick_size=getattr(args, "tick_size", None) if getattr(args, "tick_size", None) is not None else defaults["tick_size"],
+        point_value=getattr(args, "point_value", None) if getattr(args, "point_value", None) is not None else defaults["point_value"],
+        commission_rt=getattr(args, "commission_rt", None) if getattr(args, "commission_rt", None) is not None else defaults["commission_rt"],
+        slippage_ticks=getattr(args, "slippage_ticks", None) if getattr(args, "slippage_ticks", None) is not None else defaults["slippage_ticks"],
+        scale_out=scale_out,
+    )
+
+
+def round_to_tick(price, tick_size=None):
+    tick_size = tick_size or TICK
+    if tick_size <= 0:
+        return round(price, 6)
+    return round(round(price / tick_size) * tick_size, 6)
 
 
 def date_range(start, end):
@@ -195,25 +274,35 @@ def rows_from_df(df):
     return rows
 
 
-def bars_for_date(bars, date):
-    return [b for b in bars if b["time"].startswith(date)]
+def include_bar_in_session(bar, market, session):
+    if session == "all":
+        return True
+    hhmm = bar["time"][11:16]
+    if hhmm == MARKET_CONFIG.get(market, MARKET_CONFIG["US"])["close"]:
+        return True
+    period = period_for_time(bar["time"], market)
+    return period not in ("closed", "lunch")
 
 
-def bars_before_date(bars, date):
-    return [b for b in bars if b["time"][:10] < date]
+def bars_for_date(bars, date, market="US", session="rth"):
+    return [b for b in bars if b["time"].startswith(date) and include_bar_in_session(b, market, session)]
 
 
-def process_snapshot(code, daily, five, date, bar_limit):
-    today_raw = bars_for_date(five, date)[:bar_limit]
+def bars_before_date(bars, date, market="US", session="rth"):
+    return [b for b in bars if b["time"][:10] < date and include_bar_in_session(b, market, session)]
+
+
+def process_snapshot(code, daily, five, date, bar_limit, session="rth"):
+    market = infer_market(code)
+    today_raw = bars_for_date(five, date, market, session)[:bar_limit]
     if not today_raw:
         return None
 
-    market = infer_market(code)
     prior_daily = [d for d in daily if d["time"][:10] < date]
     if len(prior_daily) < 20:
         return None
 
-    prior_5m = bars_before_date(five, date)
+    prior_5m = bars_before_date(five, date, market, session)
     work = [dict(b) for b in (prior_5m[-80:] + today_raw)[-80:]]
     today_start = len(work) - len(today_raw)
 
@@ -403,6 +492,8 @@ def analyze_snapshot(snap):
     bars = snap["intraday"]["bars"]
     cur = bars[-1]
     n = snap["session"]["bars_today"]
+    if snap["session"]["current_period"] == "closed":
+        return watch(snap, "休市", "N0✗", "休市时段不产生入场信号")
     if n < 3:
         return watch(snap, "数据不足", "N0✗", "今日少于3根5分钟K线")
     if snap["session"]["is_lunch"]:
@@ -709,8 +800,8 @@ def build_order(snap, structure, direction, signal, veto_line, score):
     order_type = "market_next_open" if structure == "震荡区间" else "stop"
 
     if direction == "long":
-        entry = cur["c"] if order_type == "market_next_open" else round(cur["h"] + TICK, 2)
-        stop = round(cur["l"] - TICK, 2)
+        entry = cur["c"] if order_type == "market_next_open" else round_to_tick(cur["h"] + TICK)
+        stop = round_to_tick(cur["l"] - TICK)
         risk = round(entry - stop, 4)
         magnets = [
             snap["intraday"]["today_range"]["high"],
@@ -719,10 +810,10 @@ def build_order(snap, structure, direction, signal, veto_line, score):
             entry + 2 * risk,
         ]
         candidates = [m for m in magnets if m > entry + 1.5 * risk]
-        target = round(min(candidates) if candidates else entry + 1.5 * risk, 2)
+        target = round_to_tick(min(candidates) if candidates else entry + 1.5 * risk)
     else:
-        entry = cur["c"] if order_type == "market_next_open" else round(cur["l"] - TICK, 2)
-        stop = round(cur["h"] + TICK, 2)
+        entry = cur["c"] if order_type == "market_next_open" else round_to_tick(cur["l"] - TICK)
+        stop = round_to_tick(cur["h"] + TICK)
         risk = round(stop - entry, 4)
         magnets = [
             snap["intraday"]["today_range"]["low"],
@@ -731,7 +822,7 @@ def build_order(snap, structure, direction, signal, veto_line, score):
             entry - 2 * risk,
         ]
         candidates = [m for m in magnets if m < entry - 1.5 * risk]
-        target = round(max(candidates) if candidates else entry - 1.5 * risk, 2)
+        target = round_to_tick(max(candidates) if candidates else entry - 1.5 * risk)
 
     if risk <= 0 or risk > 0.30 * adr:
         return None
@@ -743,15 +834,18 @@ def build_order(snap, structure, direction, signal, veto_line, score):
         order_type=order_type,
         signal_time=cur["time"],
         signal_day_idx=snap["session"]["bars_today"],
-        entry=round(entry, 2),
-        stop=round(stop, 2),
-        target=round(target, 2),
+        entry=round_to_tick(entry),
+        stop=round_to_tick(stop),
+        target=round_to_tick(target),
         risk=round(risk, 4),
         structure=structure,
         confidence="中" if score == 0 else "弱",
         reason=signal["reason"],
         veto_line=veto_line,
         expires_day_idx=snap["session"]["bars_today"] + 3,
+        signal_period=snap["session"]["current_period"],
+        adr_pct=snap["intraday"]["adr_consumed_pct"],
+        range_position=snap["intraday"]["range_position"],
     )
 
 
@@ -798,22 +892,27 @@ def format_veto(vetoes, score):
 
 
 def run_backtest(args, daily, five):
+    global TICK
+    instrument = resolve_instrument(args)
+    TICK = instrument.tick_size
+    session = getattr(args, "session", "rth")
     dates = list(date_range(args.start, args.end))
+    market = infer_market(args.code)
     monitor = []
     trades = []
     day_stats = {}
 
     for date in dates:
-        day_bars = bars_for_date(five, date)
+        day_bars = bars_for_date(five, date, market, session)
         if not day_bars:
             continue
-        day_stats[date] = {"bars": len(day_bars), "signals": 0, "trades": 0, "r": 0.0}
+        day_stats[date] = {"bars": len(day_bars), "signals": 0, "trades": 0, "r": 0.0, "net_r": 0.0, "net_pnl": 0.0}
         pending = None
         position = None
         cooldown_until = 0
 
         for day_idx, _ in enumerate(day_bars, start=1):
-            snap = process_snapshot(args.code, daily, five, date, day_idx)
+            snap = process_snapshot(args.code, daily, five, date, day_idx, session)
             if not snap:
                 continue
             cur = snap["intraday"]["bars"][-1]
@@ -824,7 +923,7 @@ def run_backtest(args, daily, five):
                     event = "挂单过期"
                     pending = None
                 elif not position and day_idx > pending.signal_day_idx:
-                    fill = fill_pending(pending, cur, day_idx)
+                    fill = fill_pending(pending, cur, day_idx, instrument)
                     if fill:
                         position = fill
                         event = f"入场 {position.direction} {position.entry:.2f}"
@@ -833,11 +932,13 @@ def run_backtest(args, daily, five):
             if position:
                 exit_info = manage_position(position, cur, day_idx)
                 if exit_info:
-                    trade = make_trade(date, position, exit_info)
+                    trade = make_trade(date, position, exit_info, instrument)
                     trades.append(trade)
                     day_stats[date]["trades"] += 1
                     day_stats[date]["r"] += trade.r
-                    event = f"出场 {trade.outcome} {trade.r:.2f}R"
+                    day_stats[date]["net_r"] += trade.net_r
+                    day_stats[date]["net_pnl"] += trade.net_pnl
+                    event = f"出场 {trade.outcome} {trade.net_r:.2f}R"
                     if "止损" in trade.outcome:
                         cooldown_until = day_idx + 2
                     position = None
@@ -855,15 +956,17 @@ def run_backtest(args, daily, five):
 
         if position:
             last = day_bars[-1]
-            trade = make_trade(date, position, {"time": last["time"], "price": last["close"], "outcome": "收盘平仓"})
+            trade = make_trade(date, position, {"time": last["time"], "price": last["close"], "outcome": "收盘平仓"}, instrument)
             trades.append(trade)
             day_stats[date]["trades"] += 1
             day_stats[date]["r"] += trade.r
+            day_stats[date]["net_r"] += trade.net_r
+            day_stats[date]["net_pnl"] += trade.net_pnl
 
     return monitor, trades, day_stats
 
 
-def fill_pending(order, bar, day_idx):
+def fill_pending(order, bar, day_idx, instrument):
     if order.order_type == "market_next_open":
         entry = bar["o"]
     elif order.direction == "long":
@@ -874,6 +977,7 @@ def fill_pending(order, bar, day_idx):
         if bar["l"] > order.entry:
             return None
         entry = min(order.entry, bar["o"]) if bar["o"] < order.entry else order.entry
+    entry = round_to_tick(entry, instrument.tick_size)
 
     if order.direction == "long":
         risk = entry - order.stop
@@ -891,7 +995,7 @@ def fill_pending(order, bar, day_idx):
         direction=order.direction,
         entry_time=bar["time"],
         entry_day_idx=day_idx,
-        entry=round(entry, 2),
+        entry=entry,
         initial_stop=order.stop,
         stop=order.stop,
         target=order.target,
@@ -901,6 +1005,10 @@ def fill_pending(order, bar, day_idx):
         reason=order.reason,
         veto_line=order.veto_line,
         signal_time=order.signal_time,
+        signal_period=order.signal_period,
+        adr_pct=order.adr_pct,
+        range_position=order.range_position,
+        scale_out=instrument.scale_out,
     )
 
 
@@ -919,12 +1027,21 @@ def manage_position(pos, bar, day_idx):
     if hit_stop:
         stop_r = (pos.stop - pos.entry) / pos.risk if pos.direction == "long" else (pos.entry - pos.stop) / pos.risk
         total_r = pos.realized_r + pos.size_left * stop_r
-        return {"time": bar["time"], "price": pos.stop, "outcome": "保本/止损" if pos.partial_taken else "止损", "r": total_r}
+        if pos.partial_taken:
+            outcome = "保本/止损"
+        elif pos.breakeven_moved:
+            outcome = "保本"
+        else:
+            outcome = "止损"
+        return {"time": bar["time"], "price": pos.stop, "outcome": outcome, "r": total_r}
 
-    if not pos.partial_taken and hit_one_r:
-        pos.partial_taken = True
-        pos.realized_r += 0.5
-        pos.size_left = 0.5
+    if not pos.partial_taken and not pos.breakeven_moved and hit_one_r:
+        if pos.scale_out:
+            pos.partial_taken = True
+            pos.realized_r += 0.5
+            pos.size_left = 0.5
+        else:
+            pos.breakeven_moved = True
         pos.stop = pos.entry
 
     if hit_target:
@@ -938,6 +1055,12 @@ def manage_position(pos, bar, day_idx):
         if pos.direction == "short" and bar["h"] >= pos.stop:
             return {"time": bar["time"], "price": pos.stop, "outcome": "保本", "r": pos.realized_r}
 
+    if pos.breakeven_moved:
+        if pos.direction == "long" and bar["l"] <= pos.stop:
+            return {"time": bar["time"], "price": pos.stop, "outcome": "保本", "r": 0.0}
+        if pos.direction == "short" and bar["h"] >= pos.stop:
+            return {"time": bar["time"], "price": pos.stop, "outcome": "保本", "r": 0.0}
+
     if bar["time"][11:16] >= "15:55":
         total_r = pos.realized_r + pos.size_left * close_r
         return {"time": bar["time"], "price": bar["c"], "outcome": "收盘平仓", "r": total_r}
@@ -945,42 +1068,147 @@ def manage_position(pos, bar, day_idx):
     return None
 
 
-def make_trade(date, pos, exit_info):
+def make_trade(date, pos, exit_info, instrument):
+    gross_r = round(exit_info.get("r", 0.0), 4)
+    risk_dollars = pos.risk * instrument.point_value * instrument.contracts
+    gross_pnl = gross_r * risk_dollars
+    slippage_cost = 2 * instrument.slippage_ticks * instrument.tick_size * instrument.point_value * instrument.contracts
+    commission = instrument.commission_rt * instrument.contracts
+    net_pnl = gross_pnl - slippage_cost - commission
+    net_r = net_pnl / risk_dollars if risk_dollars else gross_r
     return Trade(
         date=date,
         direction="做多" if pos.direction == "long" else "做空",
         signal_time=pos.signal_time,
         entry_time=pos.entry_time,
         exit_time=exit_info["time"],
-        entry=round(pos.entry, 2),
-        initial_stop=round(pos.initial_stop, 2),
-        target=round(pos.target, 2),
-        exit=round(exit_info["price"], 2),
-        r=round(exit_info.get("r", 0.0), 2),
+        entry=round_to_tick(pos.entry, instrument.tick_size),
+        initial_stop=round_to_tick(pos.initial_stop, instrument.tick_size),
+        target=round_to_tick(pos.target, instrument.tick_size),
+        exit=round_to_tick(exit_info["price"], instrument.tick_size),
+        r=round(gross_r, 2),
         outcome=exit_info["outcome"],
         partial_taken=pos.partial_taken,
         structure=pos.structure,
         confidence=pos.confidence,
         reason=pos.reason,
         veto_line=pos.veto_line,
+        signal_period=pos.signal_period,
+        adr_pct=pos.adr_pct,
+        range_position=pos.range_position,
+        gross_r=round(gross_r, 2),
+        net_r=round(net_r, 2),
+        risk_dollars=round(risk_dollars, 2),
+        gross_pnl=round(gross_pnl, 2),
+        net_pnl=round(net_pnl, 2),
+        commission=round(commission, 2),
+        slippage_cost=round(slippage_cost, 2),
+    )
+
+
+def adr_bucket(adr_pct):
+    if adr_pct < 50:
+        return "<50% ADR"
+    if adr_pct < 80:
+        return "50-80% ADR"
+    if adr_pct < 100:
+        return "80-100% ADR"
+    return ">100% ADR"
+
+
+def profit_factor(pnls):
+    gains = sum(p for p in pnls if p > 0)
+    losses = abs(sum(p for p in pnls if p < 0))
+    if losses == 0:
+        return None if gains == 0 else float("inf")
+    return gains / losses
+
+
+def max_consecutive_losses(rs):
+    longest = current = 0
+    for r in rs:
+        if r < 0:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
+
+
+def summarize_trades(trades):
+    net_rs = [t.net_r for t in trades]
+    gross_rs = [t.gross_r for t in trades]
+    net_pnls = [t.net_pnl for t in trades]
+    wins = [t for t in trades if t.net_r > 0]
+    losses = [t for t in trades if t.net_r < 0]
+    pf = profit_factor(net_pnls)
+    return {
+        "trades": len(trades),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": round(len(wins) / len(trades) * 100, 1) if trades else 0,
+        "total_gross_r": round(sum(gross_rs), 2),
+        "total_net_r": round(sum(net_rs), 2),
+        "total_net_pnl": round(sum(net_pnls), 2),
+        "profit_factor": None if pf is None else "∞" if pf == float("inf") else round(pf, 2),
+        "expectancy_r": round(sum(net_rs) / len(trades), 2) if trades else 0,
+        "avg_win_r": round(sum(t.net_r for t in wins) / len(wins), 2) if wins else 0,
+        "avg_loss_r": round(sum(t.net_r for t in losses) / len(losses), 2) if losses else 0,
+        "max_drawdown_r": max_drawdown(net_rs),
+        "max_consecutive_losses": max_consecutive_losses(net_rs),
+    }
+
+
+def grouped_stats(trades, key_func):
+    groups = {}
+    for trade in trades:
+        key = key_func(trade)
+        groups.setdefault(key, []).append(trade)
+    rows = []
+    for key, items in sorted(groups.items()):
+        summary = summarize_trades(items)
+        rows.append({"group": key, **summary})
+    return rows
+
+
+def render_group_table(rows):
+    body = "\n".join(
+        f"<tr><td>{escape(str(r['group']))}</td><td>{r['trades']}</td><td>{r['win_rate']}%</td>"
+        f"<td>{r['total_net_r']:.2f}</td><td>{r['total_net_pnl']:.2f}</td><td>{r['profit_factor']}</td><td>{r['expectancy_r']:.2f}</td></tr>"
+        for r in rows
+    )
+    return (
+        "<table><thead><tr><th>分组</th><th>交易数</th><th>胜率</th><th>净R</th>"
+        "<th>净PnL</th><th>PF</th><th>期望R</th></tr></thead>"
+        f"<tbody>{body}</tbody></table>"
     )
 
 
 def render_html(args, metadata, daily, five, monitor, trades, day_stats, out_path):
+    instrument = resolve_instrument(args)
+    market = infer_market(args.code)
+    session = getattr(args, "session", "rth")
     dates = list(day_stats)
-    total_r = round(sum(t.r for t in trades), 2)
-    wins = sum(1 for t in trades if t.r > 0)
-    losses = sum(1 for t in trades if t.r < 0)
-    win_rate = round(wins / len(trades) * 100, 1) if trades else 0
-    max_dd = max_drawdown([t.r for t in trades])
+    summary = summarize_trades(trades)
     watch_count = sum(1 for r in monitor if r["advice"] == "观望")
     watch_pct = round(watch_count / len(monitor) * 100, 1) if monitor else 0
+    structure_rows = grouped_stats(trades, lambda t: t.structure)
+    period_rows = grouped_stats(trades, lambda t: t.signal_period or "unknown")
+    adr_rows = grouped_stats(trades, lambda t: adr_bucket(t.adr_pct))
+    management_note = (
+        "到 +1R 后半仓止盈并把剩余仓位止损移到保本"
+        if instrument.scale_out
+        else "一手合约按离散合约管理：到 +1R 只把止损移到保本，不做半仓止盈"
+    )
 
     trade_rows = "\n".join(
         f"<tr><td>{t.date}</td><td>{t.direction}</td><td>{t.signal_time[11:16]}</td><td>{t.entry_time[11:16]}</td>"
         f"<td>{t.exit_time[11:16]}</td><td>{t.entry:.2f}</td><td>{t.initial_stop:.2f}</td><td>{t.target:.2f}</td>"
-        f"<td>{t.exit:.2f}</td><td>{'是' if t.partial_taken else '否'}</td><td class='{ 'win' if t.r > 0 else 'loss' if t.r < 0 else ''}'>{t.r:.2f}</td>"
-        f"<td>{escape(t.outcome)}</td><td>{escape(t.structure)}</td><td>{escape(t.reason)}</td></tr>"
+        f"<td>{t.exit:.2f}</td><td>{'是' if t.partial_taken else '否'}</td>"
+        f"<td>{t.gross_r:.2f}</td><td class='{ 'win' if t.net_r > 0 else 'loss' if t.net_r < 0 else ''}'>{t.net_r:.2f}</td>"
+        f"<td class='{ 'win' if t.net_pnl > 0 else 'loss' if t.net_pnl < 0 else ''}'>{t.net_pnl:.2f}</td>"
+        f"<td>{t.risk_dollars:.2f}</td><td>{(t.commission + t.slippage_cost):.2f}</td>"
+        f"<td>{escape(t.outcome)}</td><td>{escape(t.structure)}</td><td>{escape(t.signal_period)}</td><td>{t.adr_pct:.1f}%</td><td>{escape(t.reason)}</td></tr>"
         for t in trades
     )
 
@@ -988,7 +1216,7 @@ def render_html(args, metadata, daily, five, monitor, trades, day_stats, out_pat
     for date in dates:
         rows = [r for r in monitor if r["date"] == date]
         day_trades = [t for t in trades if t.date == date]
-        chart = render_day_svg(date, bars_for_date(five, date), day_trades)
+        chart = render_day_svg(date, bars_for_date(five, date, market, session), day_trades)
         table_rows = "\n".join(
             f"<tr><td>{r['time'][11:16]}</td><td>{r['close']:.2f}</td><td>{escape(r['structure'])}</td><td>{escape(r['direction'])}</td>"
             f"<td>{escape(r['advice'])}</td><td>{escape(r['confidence'])}</td><td>{r['range_position']:.2f}</td><td>{r['adr']:.1f}%</td>"
@@ -1007,6 +1235,8 @@ def render_html(args, metadata, daily, five, monitor, trades, day_stats, out_pat
                   <p><b>Signals</b>: {day_stats[date]['signals']}</p>
                   <p><b>Trades</b>: {day_stats[date]['trades']}</p>
                   <p><b>R</b>: {day_stats[date]['r']:.2f}</p>
+                  <p><b>Net R</b>: {day_stats[date]['net_r']:.2f}</p>
+                  <p><b>Net PnL</b>: {day_stats[date]['net_pnl']:.2f}</p>
                 </div>
               </div>
               <details>
@@ -1026,14 +1256,16 @@ def render_html(args, metadata, daily, five, monitor, trades, day_stats, out_pat
         "start": args.start,
         "end": args.end,
         "metadata": metadata,
+        "instrument": asdict(instrument),
+        "session": session,
         "summary": {
-            "trades": len(trades),
-            "wins": wins,
-            "losses": losses,
-            "win_rate": win_rate,
-            "total_r": total_r,
-            "max_drawdown_r": max_dd,
+            **summary,
             "watch_pct": watch_pct,
+        },
+        "groups": {
+            "structure": structure_rows,
+            "period": period_rows,
+            "adr": adr_rows,
         },
         "trades": [asdict(t) for t in trades],
     }
@@ -1049,7 +1281,7 @@ def render_html(args, metadata, daily, five, monitor, trades, day_stats, out_pat
     header {{ padding: 28px 36px; background: #111827; color: #fff; }}
     h1 {{ margin: 0 0 8px; font-size: 24px; }}
     main {{ padding: 24px 36px 48px; }}
-    .cards {{ display: grid; grid-template-columns: repeat(6, minmax(120px, 1fr)); gap: 12px; margin-bottom: 18px; }}
+    .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; margin-bottom: 18px; }}
     .card, section {{ background: #fff; border: 1px solid #d9dde5; border-radius: 8px; }}
     .card {{ padding: 14px; }}
     .label {{ color: #667085; font-size: 12px; }}
@@ -1071,25 +1303,39 @@ def render_html(args, metadata, daily, five, monitor, trades, day_stats, out_pat
 <body>
   <header>
     <h1>{escape(args.code)} Price Action 回测报告</h1>
-    <div>区间：{escape(args.start)} 至 {escape(args.end)} · 数据源：{escape(metadata['source'])} · 模式：5分钟收盘后逐根模拟</div>
+    <div>区间：{escape(args.start)} 至 {escape(args.end)} · 数据源：{escape(metadata['source'])} · 模式：5分钟收盘后逐根模拟 · 时段：{escape(session.upper())}</div>
+    <div>合约/成本：{escape(instrument.profile.upper())} · {instrument.contracts} 手 · tick {instrument.tick_size:g} · ${instrument.point_value:g}/点 · 手续费 ${instrument.commission_rt:g}/手/RT · 滑点 {instrument.slippage_ticks:g} tick/边</div>
   </header>
   <main>
     <div class="cards">
-      <div class="card"><div class="label">交易数</div><div class="value">{len(trades)}</div></div>
-      <div class="card"><div class="label">胜率</div><div class="value">{win_rate}%</div></div>
-      <div class="card"><div class="label">总R</div><div class="value">{total_r:.2f}</div></div>
-      <div class="card"><div class="label">最大回撤R</div><div class="value">{max_dd:.2f}</div></div>
+      <div class="card"><div class="label">交易数</div><div class="value">{summary['trades']}</div></div>
+      <div class="card"><div class="label">胜率</div><div class="value">{summary['win_rate']}%</div></div>
+      <div class="card"><div class="label">净R</div><div class="value">{summary['total_net_r']:.2f}</div></div>
+      <div class="card"><div class="label">净PnL</div><div class="value">${summary['total_net_pnl']:.2f}</div></div>
+      <div class="card"><div class="label">Profit Factor</div><div class="value">{summary['profit_factor']}</div></div>
+      <div class="card"><div class="label">期望R/笔</div><div class="value">{summary['expectancy_r']:.2f}</div></div>
+      <div class="card"><div class="label">最大回撤R</div><div class="value">{summary['max_drawdown_r']:.2f}</div></div>
+      <div class="card"><div class="label">最大连亏</div><div class="value">{summary['max_consecutive_losses']}</div></div>
       <div class="card"><div class="label">观望比例</div><div class="value">{watch_pct}%</div></div>
       <div class="card"><div class="label">监控点</div><div class="value">{len(monitor)}</div></div>
     </div>
     <section>
       <h2>修正版规则</h2>
-      <p class="note">震荡区间只在上下沿做反转，不在中部追突破；宽通道避免在高位追多或低位追空，非正确边缘的微型双顶/双底必须有清晰支撑阻力或放弃；TR bar 微型双和外包K线回撤不作为普通 stop entry；止损后至少冷却两根K线；微型双顶/双底和意外强势必须由当前K线方向确认；趋势/通道用顺势 stop entry；成交后按实际入场价重新校验风险和盈亏比；到 +1R 后半仓止盈并把剩余仓位止损移到保本；同根K线止损与目标同时出现时按保守顺序处理；不隔夜。</p>
+      <p class="note">震荡区间只在上下沿做反转，不在中部追突破；宽通道避免在高位追多或低位追空，非正确边缘的微型双顶/双底必须有清晰支撑阻力或放弃；TR bar 微型双和外包K线回撤不作为普通 stop entry；止损后至少冷却两根K线；微型双顶/双底和意外强势必须由当前K线方向确认；趋势/通道用顺势 stop entry；成交后按实际入场价重新校验风险和盈亏比；{management_note}；同根K线止损与目标同时出现时按保守顺序处理；不隔夜。</p>
+    </section>
+    <section>
+      <h2>分组统计</h2>
+      <h3>结构</h3>
+      {render_group_table(structure_rows)}
+      <h3>时段</h3>
+      {render_group_table(period_rows)}
+      <h3>ADR</h3>
+      {render_group_table(adr_rows)}
     </section>
     <section>
       <h2>交易明细</h2>
       <table>
-        <thead><tr><th>日期</th><th>方向</th><th>信号</th><th>入场</th><th>出场</th><th>入场价</th><th>初始止损</th><th>目标</th><th>出场价</th><th>1R减仓</th><th>R</th><th>结果</th><th>结构</th><th>原因</th></tr></thead>
+        <thead><tr><th>日期</th><th>方向</th><th>信号</th><th>入场</th><th>出场</th><th>入场价</th><th>初始止损</th><th>目标</th><th>出场价</th><th>1R减仓</th><th>毛R</th><th>净R</th><th>净PnL</th><th>初始风险$</th><th>成本$</th><th>结果</th><th>结构</th><th>时段</th><th>ADR</th><th>原因</th></tr></thead>
         <tbody>{trade_rows}</tbody>
       </table>
     </section>
@@ -1126,8 +1372,8 @@ def render_day_svg(date, bars, trades):
             color = "#047857" if t.direction == "做多" else "#b42318"
             marks.append(f"<circle cx='{x(ei):.1f}' cy='{y(t.entry):.1f}' r='4' fill='{color}'><title>{t.direction} entry {t.entry}</title></circle>")
         if xi is not None:
-            color = "#047857" if t.r > 0 else "#b42318"
-            marks.append(f"<rect x='{x(xi)-3:.1f}' y='{y(t.exit)-3:.1f}' width='6' height='6' fill='{color}'><title>exit {t.exit} {t.r}R</title></rect>")
+            color = "#047857" if t.net_r > 0 else "#b42318"
+            marks.append(f"<rect x='{x(xi)-3:.1f}' y='{y(t.exit)-3:.1f}' width='6' height='6' fill='{color}'><title>exit {t.exit} {t.net_r}R net</title></rect>")
     return f"""
     <svg viewBox="0 0 {w} {h}" role="img" aria-label="{date} price path">
       <text x="{pad}" y="18" font-size="13" fill="#344054">{date}</text>
@@ -1159,6 +1405,8 @@ def main():
     args = parse_args()
     daily, five, metadata = load_or_fetch(args)
     monitor, trades, day_stats = run_backtest(args, daily, five)
+    instrument = resolve_instrument(args)
+    summary = summarize_trades(trades)
     if args.output:
         out = Path(args.output)
     else:
@@ -1170,10 +1418,17 @@ def main():
             {
                 "report": str(out),
                 "source": metadata["source"],
+                "profile": instrument.profile,
+                "contracts": instrument.contracts,
+                "session": getattr(args, "session", "rth"),
                 "monitor_records": len(monitor),
-                "trades": len(trades),
-                "total_r": round(sum(t.r for t in trades), 2),
-                "win_rate": round(sum(1 for t in trades if t.r > 0) / len(trades) * 100, 1) if trades else 0,
+                "trades": summary["trades"],
+                "total_gross_r": summary["total_gross_r"],
+                "total_net_r": summary["total_net_r"],
+                "total_net_pnl": summary["total_net_pnl"],
+                "win_rate": summary["win_rate"],
+                "profit_factor": summary["profit_factor"],
+                "max_drawdown_r": summary["max_drawdown_r"],
             },
             ensure_ascii=False,
             indent=2,

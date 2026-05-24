@@ -47,6 +47,14 @@ For backtests:
 python "F:/个人知识库/codex_pa/tools/price_action_backtester.py" --code US.SPY --start YYYY-MM-DD --end YYYY-MM-DD --refresh
 ```
 
+For E-mini S&P 500 futures, prefer the actual Futu futures code such as `US.ESmain` when available, and use the ES profile:
+
+```powershell
+python "F:/个人知识库/codex_pa/tools/price_action_backtester.py" --code US.ESmain --profile es --contracts 1 --session rth --start YYYY-MM-DD --end YYYY-MM-DD --refresh
+```
+
+`--profile es` uses 0.25 tick size, `$50` per index point, one contract by default, and one-contract management: no half scale-out; at `+1R`, move the stop to breakeven. `--session rth` keeps the Al Brooks 5m workflow on regular trading hours. Commission and slippage are configurable with `--commission-rt` and `--slippage-ticks`.
+
 ## Hard Gates
 
 Apply these before considering entries:
@@ -125,6 +133,15 @@ Follow this order strictly. The sequence is the edge.
    - Trading range: scalp plan only at edges; quick profit, wider stop only with reduced size.
    - Do not convert a losing scalp into a swing. If trapped in a trend, stop out; if trapped in a range, scale-in only when total risk remains normal.
    - After a stop-out, wait at least two bars or a fresh strong breakout/follow-through before reversing; do not immediately flip inside the same small structure.
+   - For one ES contract, do not claim partial profits. Manage as one unit: move to breakeven after `+1R`, then either target, breakeven, stop, or end-of-day exit.
+
+## E-mini One-Contract Defaults
+
+- ES contract accounting: 0.25 tick, `$12.50` per tick, `$50` per point.
+- Default to `--session rth` for ES unless the user explicitly asks for Globex/all-session research.
+- Backtest reports must show net PnL, net R, gross R, initial dollar risk, cost, Profit Factor, expectancy, max drawdown, consecutive losses, and group stats by structure, session period, and ADR bucket.
+- Treat commission and slippage as assumptions, not facts. Ask the user for their broker's actual round-turn cost when sizing real trades.
+- If Futu cannot fetch `US.ESmain`, ask for the exact Futu futures code or futures market-data permission. Backtest SPY only as a signal proxy, clearly labeling it as a proxy and never as ES dollar PnL.
 
 ## Opening Rules
 
