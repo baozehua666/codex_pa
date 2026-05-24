@@ -240,6 +240,29 @@ def process_snapshot(code, daily, five, date, bar_limit):
     day_range = max(today_high - today_low, TICK)
     adr_consumed = round(day_range / adr * 100, 2) if adr else 0
 
+    def opening_range(first_n):
+        if len(today) < first_n:
+            return {"complete": False}
+        chunk = today[:first_n]
+        hi = max(b["high"] for b in chunk)
+        lo = min(b["low"] for b in chunk)
+        width = hi - lo
+        close = work[-1]["close"]
+        if close > hi:
+            state = "above"
+        elif close < lo:
+            state = "below"
+        else:
+            state = "inside"
+        return {
+            "complete": True,
+            "high": round(hi, 4),
+            "low": round(lo, 4),
+            "width": round(width, 4),
+            "position": round((close - lo) / width, 3) if width > 0 else None,
+            "state": state,
+        }
+
     ema_crosses = 0
     for i in range(today_start + 1, len(work)):
         if (work[i - 1]["close"] > work[i - 1]["ema20"]) != (work[i]["close"] > work[i]["ema20"]):
@@ -329,6 +352,10 @@ def process_snapshot(code, daily, five, date, bar_limit):
             "ema_crosses_today": ema_crosses,
             "today_range": {"high": round(today_high, 4), "low": round(today_low, 4)},
             "range_position": round((work[-1]["close"] - today_low) / day_range, 3),
+            "opening_range": {
+                "first_30m": opening_range(6),
+                "first_90m": opening_range(18),
+            },
             "adr_consumed_pct": adr_consumed,
             "bar_balance": {"bull": bull, "bear": bear, "neutral": neutral, "bias": bias},
             "bar_stats": {
@@ -361,6 +388,15 @@ def minutes_to_close(time_key, market="US"):
     hour, minute = [int(part) for part in close_hhmm.split(":")]
     close = dt.replace(hour=hour, minute=minute, second=0)
     return max(0, int((close - dt).total_seconds() // 60))
+
+
+def opening_label(snap, key):
+    info = snap["intraday"].get("opening_range", {}).get(key, {})
+    if not info.get("complete"):
+        return "未形成"
+    pos = info.get("position")
+    state = {"above": "上方", "below": "下方", "inside": "内部"}.get(info.get("state"), info.get("state", ""))
+    return f"{state} {pos:.2f}" if pos is not None else state
 
 
 def analyze_snapshot(snap):
@@ -414,6 +450,8 @@ def analyze_snapshot(snap):
         "bar_type": cur["bar_type"],
         "adr": snap["intraday"]["adr_consumed_pct"],
         "range_position": snap["intraday"]["range_position"],
+        "opening_30m": opening_label(snap, "first_30m"),
+        "opening_90m": opening_label(snap, "first_90m"),
     }
 
 
@@ -579,6 +617,7 @@ def score_vetoes(snap, structure, direction, signal):
     cur = bars[-1]
     today = bars[intr["today_start_idx"] :]
     pos = intr["range_position"]
+    reason = signal.get("reason", "")
     vetoes = []
 
     if structure == "突破/窄通道":
@@ -595,10 +634,9 @@ def score_vetoes(snap, structure, direction, signal):
     if structure == "宽通道":
         if direction == "long" and pos > 0.70:
             vetoes.append(("V3", 3, "宽通道买在高位"))
-        if direction == "short" and pos < 0.35:
+        if direction == "short" and pos < 0.40:
             vetoes.append(("V3", 3, "宽通道卖在低位"))
         if signal.get("valid"):
-            reason = signal.get("reason", "")
             if direction == "long" and "微型双底" in reason and pos > 0.45:
                 vetoes.append(("V14", 3, "宽通道非下沿微型双底"))
             if direction == "short" and "微型双顶" in reason and pos < 0.55:
@@ -615,6 +653,12 @@ def score_vetoes(snap, structure, direction, signal):
 
     if cur["body_strength"] == "large" and signal["valid"] and "breakout" in cur["bar_type"]:
         vetoes.append(("V5", 3, "追大K线"))
+
+    if signal.get("valid"):
+        if "微型双" in reason and cur["bar_type"] == "tr_bar":
+            vetoes.append(("V14", 3, "微型双信号是交易区间K线"))
+        if "回撤均线" in reason and cur.get("is_outside"):
+            vetoes.append(("V14", 3, "外包K线回撤信号"))
 
     micro = intr["micro_channel"]
     if micro.get("active"):
@@ -729,6 +773,8 @@ def watch(snap, structure, path, reason, veto_line=None, direction="none"):
         "bar_type": cur["bar_type"],
         "adr": snap["intraday"]["adr_consumed_pct"],
         "range_position": snap["intraday"].get("range_position", 0),
+        "opening_30m": opening_label(snap, "first_30m"),
+        "opening_90m": opening_label(snap, "first_90m"),
     }
 
 
@@ -946,6 +992,7 @@ def render_html(args, metadata, daily, five, monitor, trades, day_stats, out_pat
         table_rows = "\n".join(
             f"<tr><td>{r['time'][11:16]}</td><td>{r['close']:.2f}</td><td>{escape(r['structure'])}</td><td>{escape(r['direction'])}</td>"
             f"<td>{escape(r['advice'])}</td><td>{escape(r['confidence'])}</td><td>{r['range_position']:.2f}</td><td>{r['adr']:.1f}%</td>"
+            f"<td>{escape(r.get('opening_30m', ''))}</td><td>{escape(r.get('opening_90m', ''))}</td>"
             f"<td>{escape(r['bar_type'])}</td><td>{escape(r['reason'])}</td><td>{escape(r['veto_line'].replace('> ', ''))}</td><td>{escape(r['event'])}</td></tr>"
             for r in rows
         )
@@ -965,7 +1012,7 @@ def render_html(args, metadata, daily, five, monitor, trades, day_stats, out_pat
               <details>
                 <summary>实时监控记录 ({len(rows)} 条)</summary>
                 <table>
-                  <thead><tr><th>时间</th><th>收盘</th><th>结构</th><th>方向</th><th>建议</th><th>信心</th><th>区间位置</th><th>ADR</th><th>K线</th><th>原因</th><th>否决</th><th>事件</th></tr></thead>
+                  <thead><tr><th>时间</th><th>收盘</th><th>结构</th><th>方向</th><th>建议</th><th>信心</th><th>区间位置</th><th>ADR</th><th>OR30</th><th>OR90</th><th>K线</th><th>原因</th><th>否决</th><th>事件</th></tr></thead>
                   <tbody>{table_rows}</tbody>
                 </table>
               </details>
@@ -1037,7 +1084,7 @@ def render_html(args, metadata, daily, five, monitor, trades, day_stats, out_pat
     </div>
     <section>
       <h2>修正版规则</h2>
-      <p class="note">震荡区间只在上下沿做反转，不在中部追突破；宽通道避免在高位追多或低位追空，非正确边缘的微型双顶/双底必须有清晰支撑阻力或放弃；止损后至少冷却两根K线；微型双顶/双底和意外强势必须由当前K线方向确认；趋势/通道用顺势 stop entry；成交后按实际入场价重新校验风险和盈亏比；到 +1R 后半仓止盈并把剩余仓位止损移到保本；同根K线止损与目标同时出现时按保守顺序处理；不隔夜。</p>
+      <p class="note">震荡区间只在上下沿做反转，不在中部追突破；宽通道避免在高位追多或低位追空，非正确边缘的微型双顶/双底必须有清晰支撑阻力或放弃；TR bar 微型双和外包K线回撤不作为普通 stop entry；止损后至少冷却两根K线；微型双顶/双底和意外强势必须由当前K线方向确认；趋势/通道用顺势 stop entry；成交后按实际入场价重新校验风险和盈亏比；到 +1R 后半仓止盈并把剩余仓位止损移到保本；同根K线止损与目标同时出现时按保守顺序处理；不隔夜。</p>
     </section>
     <section>
       <h2>交易明细</h2>

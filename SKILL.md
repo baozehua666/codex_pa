@@ -87,7 +87,7 @@ Follow this order strictly. The sequence is the edge.
    |---|---:|---|
    | V1 | 5 | Counter-trend in a tight channel |
    | V2 | 5 | Trading range middle: not near lower 40% for longs or upper 60% for shorts |
-   | V3 | 3 | Buying resistance or selling support, including wide-channel high/low chase |
+   | V3 | 3 | Buying resistance or selling support, including wide-channel high/low chase; for broad-channel shorts, lower 40% is support |
    | V4 | 3 | Stop >30% ADR, structurally too wide, or stop placed at the wrong S/R side |
    | V5 | 3 | Chasing a big bar/gap without pullback or follow-through |
    | V6 | 3 | First reversal of a micro channel |
@@ -98,7 +98,7 @@ Follow this order strictly. The sequence is the edge.
    | V11 | 1 | Chasing a 9+ bar micro channel |
    | V12 | 1 | Opening, afternoon open, closing, or just after lunch |
    | V13 | 2 | Consecutive breakout bars likely climactic |
-   | V14 | 3 | Bad stop-order signal: poor signal bar at S/R, or broad-channel micro DT/DB not at the correct edge |
+   | V14 | 3 | Bad stop-order signal: poor signal bar at S/R, TR bar micro DT/DB, outside-bar EMA pullback, or broad-channel micro DT/DB not at the correct edge |
    | V15 | 2 | Narrow trading range where stop-order entries cannot reach reward/risk |
 
    Always show one line:
@@ -114,6 +114,8 @@ Follow this order strictly. The sequence is the edge.
    - A big signal bar can have higher probability but worse risk/reward. Size down or wait for pullback.
    - In a trading range, stop-order entries in the middle are bad; prefer failed breakouts at edges or wait.
    - In a broad channel, micro double top/bottom is valid only near the correct channel edge, range edge, or clear S/R magnet; wrong-edge or middle micro DT/DB is a weak stop-order trap, not a standalone entry.
+   - A micro double top/bottom whose confirmation bar is itself a trading-range bar is a weak stop-order signal; wait for a stronger close or a second entry.
+   - Treat outside-bar EMA pullbacks as confusion, not a standalone pullback entry, unless the next bar gives clear follow-through or forms a deliberate OO/ioi breakout setup.
 
 6. **Risk, route, and management**
    - Stop = signal bar extreme or structural invalidation point; use the trading timeframe only.
