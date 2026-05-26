@@ -47,6 +47,58 @@ For backtests:
 python "F:/个人知识库/codex_pa/tools/price_action_backtester.py" --code US.SPY --start YYYY-MM-DD --end YYYY-MM-DD --refresh
 ```
 
+For SPY, the stock profile defaults to one fixed 50-share unit, 1 tick one-way slippage, RTH-only 5-minute bars, at most two completed trades per day, and a `$75` maximum initial risk per trade. Do not model half-position exits for SPY unless the user explicitly requests scaling; use full 50-share entries and full 50-share exits. Reports include net PnL, net R, return percent on deployed notional, Profit Factor, expectancy, max drawdown, consecutive losses, and group stats by structure/session/ADR. Override sizing or assumptions only when the user explicitly gives different trading terms, e.g. `--contracts 50 --slippage-ticks 1 --max-risk-dollars 75 --capital 37297`.
+
+SPY-specific real-trading filters: avoid same-direction morning chases after gaps larger than 50% ADR; reject with-trend chases more than 30% ADR from EMA20; reject EMA pullbacks whose signal bar is a trading-range bar; before the first 90-minute opening range is complete, require EMA-pullback and micro-double trades to have bar-balance alignment; reject EMA pullbacks against bar balance or flat/wrong-slope EMA pullbacks without confirmation; in daily bull context, shorts must be high enough, and trading-range shorts must be near the upper edge; in daily bear context, broad-channel plain longs must be low enough; in trading ranges, reject plain single reversal bars when ADR consumed is below 80% unless there is clearer trapped-trader fuel such as a micro double or failed breakout; reject choppy trading-range signals after many EMA crosses; reject tight-channel micro double bottoms/tops that fight bar balance or EMA slope; reject low-ADR broad-channel plain reversals and EMA pullbacks; after any exit, wait at least two bars before a new entry.
+
+## Manual Intraday Opportunity Layer
+
+When reviewing intraday SPY days manually, separate opportunity recognition from execution. First map all Brooks-style opportunities, then grade them:
+
+- `A`: executable with the fixed 50-share SPY profile. Location, trapped-trader logic, signal, stop, and target are clear; initial risk should stay near or below `$75`; target should be at least `1.5R`, preferably `2R`.
+- `B`: valid price-action opportunity, but one of risk, location, timing, or management is weaker. Use for journal, paper, smaller size, or scalp-only logic.
+- `C`: educational observation or management cue only. Do not treat it as a trade.
+
+For manual month/day reviews, do not use Python scripts or batch backtest output as a substitute for judgment. Read cached bars day by day, compare only the relevant Brad/course notes, and write the reasoning manually.
+
+SPY full-unit execution rules:
+
+- Enter and exit the whole 50-share unit. Do not describe or score half-size exits, half-size runners, or partial profit-taking unless the user explicitly changes the execution model.
+- Predefine full-position stop and target before entry. In clear trends and strong breakout pullbacks, prefer a full 2R target or measured-move target. In trading ranges or countertrend profit-taking trades, a full 1.5R target is acceptable only when entry is at a clear edge and the target is before the opposite edge.
+- A trade that reaches 1R but fails before the predefined full target is not automatically a win. Score it by the actual full-unit exit logic: target, stop, breakeven exit after structural failure, or end-of-day exit.
+- Do not add a second 50-share unit to a trade already open. A later signal in the same direction is usually management evidence, not a fresh execution, unless the first trade has already closed and the new setup is independently A-grade.
+
+Manual review rules validated on SPY 2026-03-02 through 2026-05-22:
+
+1. Do not chase the first large bar of a wide opening range. A large signal bar can confirm direction, but the executable A trade usually comes on the pullback, second entry, or failed breakout.
+2. Strong gap plus follow-through can produce an A-grade High 1 / failed-sell setup, but only if the stop remains normal. If the first signal is too large, wait for the first small pullback.
+3. In strong small-pullback trends, failed sell signals are often buy setups. Do not count three pushes to short a tight bull channel unless there is a real trend-line break and follow-through.
+4. In wide trading ranges, A trades come from the edges: failed breakouts, micro double tops/bottoms, second entries, or clear trapped traders. Stop-order entries in the middle are `C`.
+5. After an opening spike or spike-and-channel trend, later new highs/lows are often profit-taking zones. New entries late in the channel are downgraded unless there is a fresh breakout with follow-through and normal risk.
+6. A same-day direction flip is allowed only after structure changes: trend-line break, test/retest, second signal, and clear trapped-trader fuel. Do not flip just because price has moved far.
+7. If a trade has already captured the day's A-grade premise, later same-direction signals are usually management reasons, not fresh risk.
+8. For the fixed 50-share SPY model, downgrade any Brad/Brooks idea that depends on scaling in lower or holding a partial runner. The setup can remain educational, but it is not executable `A` unless one 50-share entry has a normal stop and a full-position target.
+9. On trading-range days, use full-position `1.5R` targets at the range edge. Do not require 2R from the middle of a range, and do not count middle entries as A even if they later work.
+10. On strong trend days, prefer the first pullback or first trend-resumption entry after a clear breakout. Wedge-count shorts against a tight trend are management exits unless bears first create a real breakout and follow-through.
+11. A reversal from a gap or opening swing needs one of these before it is A-grade: failed second leg, micro double, higher low/lower high after a strong reversal, or breakout pullback with trapped traders. The first large reversal bar by itself is usually too wide.
+12. In high-volatility months or wide opening ranges, direction is not execution permission. Require risk compression: the real structural stop for 50 SPY shares should remain near or below `$75`. If only a wide stop is honest, downgrade the idea.
+13. A zero-A day is a valid outcome. Do not force a trade to satisfy a daily quota; the goal is stable weekly opportunity count, not a trade every day.
+14. The first lower high after an early selloff inside a wide opening range is not automatically A-grade. Wait for a second test/failure, clearer trapped traders, or a pullback closer to a range edge.
+15. Do not turn a wide structural stop into a tight signal-bar stop just to pass the risk filter. The stop must sit at the price level that actually invalidates the trade.
+16. After 14:30 ET, a trend-continuation entry can be A only if the prior trade is closed, the target is before a nearby magnet/support/resistance or before the close, and the stop remains normal. Otherwise treat it as management.
+
+Common SPY A-grade manual models:
+
+| Model | Required context | Execution note |
+|---|---|---|
+| Opening push failure second entry | Early push to an OR edge, three pushes/wedge/exhaustion, then strong opposite breakout | Prefer the weak pullback / lower high or higher low after the breakout, not the first large reversal bar |
+| Strong gap High 1 / failed sell | Gap with Bar 1 follow-through and weak first sell signal | Buy the failed sell or first small pullback; downgrade if far from EMA with wide stop |
+| Failed opening breakdown reversal | Low of day forms in first 30-90 minutes, bears fail to get second leg, then strong bull reversal | Wait for trend-line break plus higher low or small pullback if the reversal bar is too large |
+| Strong trend bull/bear flag recovery | Strong spike, then 15-25 bars sideways/countertrend to support/resistance | Trade back in original Always In direction after failed breakout or second entry |
+| Trading-range edge scalp/swing | Wide range with clear top/bottom and failed breakout | Only at edges; middle entries are not A |
+| Spike-and-channel late reversal | Trend-line break, retest of extreme, second entry against the old trend | Treat as profit-taking/trading-range trade, not automatic opposite trend |
+| Risk-compressed trend flag after wide open | Opening trend or wide OR creates correct direction but the first stop is too wide | Wait for the first honest pullback/flag whose structural stop fits the 50-share risk cap |
+
 For E-mini S&P 500 futures, prefer the actual Futu futures code such as `US.ESmain` when available, and use the ES profile:
 
 ```powershell
