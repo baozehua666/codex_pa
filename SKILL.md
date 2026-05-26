@@ -51,6 +51,21 @@ For SPY, the stock profile defaults to one fixed 50-share unit, 1 tick one-way s
 
 SPY-specific real-trading filters: avoid same-direction morning chases after gaps larger than 50% ADR; reject with-trend chases more than 30% ADR from EMA20; reject EMA pullbacks whose signal bar is a trading-range bar; before the first 90-minute opening range is complete, require EMA-pullback and micro-double trades to have bar-balance alignment; reject EMA pullbacks against bar balance or flat/wrong-slope EMA pullbacks without confirmation; in daily bull context, shorts must be high enough, and trading-range shorts must be near the upper edge; in daily bear context, broad-channel plain longs must be low enough; in trading ranges, reject plain single reversal bars when ADR consumed is below 80% unless there is clearer trapped-trader fuel such as a micro double or failed breakout; reject choppy trading-range signals after many EMA crosses; reject tight-channel micro double bottoms/tops that fight bar balance or EMA slope; reject low-ADR broad-channel plain reversals and EMA pullbacks; after any exit, wait at least two bars before a new entry.
 
+## Strict Real-Time Trading Logic
+
+Use this live decision clock for SPY unless the user explicitly asks for a different timeframe:
+
+1. The 5-minute bar is the primary decision bar. Analyze only after a 5-minute bar has closed, using closed bars only. Ignore unfinished 5-minute bars for signal generation.
+2. At each 5-minute close, run the sequence: daily/prior-session context -> current intraday structure -> Always In direction -> location -> veto score -> signal quality -> 50-share risk/target.
+3. If bar `N` creates a valid plan, the order can trigger only from bar `N+1`. Never backfill an entry into bar `N` or an earlier bar.
+4. Every live plan must state: decision time, known bars, position status, entry trigger, full-position stop, full-position target, 50-share dollar risk, reason, invalidation, and next check time.
+5. Use 1-minute bars only after a 5-minute plan exists, to verify execution sequence inside the next 5-minute bar: entry triggered, stop hit, target hit, still open, or not triggered. Do not use 1-minute bars to create additional signals unless the user asks for a 1-minute strategy.
+6. If entry, stop, and target sequence cannot be resolved even with 1-minute bars, use conservative accounting or label the fill path uncertain.
+7. Keep the SPY execution model fixed: one 50-share unit, whole-position entry, whole-position exit, no half exit, no runner, no scale-in, no second unit while a trade is open.
+8. A live call may be `observe`, `place long stop`, `place short stop`, `manage`, or `exit`. Default to `observe` if structure, location, signal, or risk is unclear.
+9. After a stop-out, wait at least two completed 5-minute bars or a fresh strong breakout with follow-through before considering a new trade.
+10. Stop trading new A setups after two completed trades in the day unless the user explicitly overrides the daily trade cap.
+
 ## Manual Intraday Opportunity Layer
 
 When reviewing intraday SPY days manually, separate opportunity recognition from execution. First map all Brooks-style opportunities, then grade them:
@@ -60,6 +75,8 @@ When reviewing intraday SPY days manually, separate opportunity recognition from
 - `C`: educational observation or management cue only. Do not treat it as a trade.
 
 For manual month/day reviews, do not use Python scripts or batch backtest output as a substitute for judgment. Read cached bars day by day, compare only the relevant Brad/course notes, and write the reasoning manually.
+
+For strict historical replay, follow a no-lookahead clock: analyze immediately after each 5-minute bar closes using only bars `1..N`; any new order can trigger only from bar `N+1`. Do not batch several bars and then backfill an earlier entry. Use 1-minute bars only to verify execution order inside a 5-minute bar, not to create extra 1-minute signals, unless the user explicitly asks for a 1-minute strategy.
 
 SPY full-unit execution rules:
 
