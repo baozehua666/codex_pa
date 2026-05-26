@@ -44,6 +44,16 @@ Purpose: persistent local memory for the SPY Al Brooks workflow.
 6. After one good A trade captures the day's premise, later same-direction signals are usually management.
 7. Zero-A days are valid.
 8. Do not tighten a wide structural stop just to pass the risk cap.
+9. Trading-range edge failed-breakout trades need predefined failure criteria. If the hard stop and premise level still hold, do not force an early exit from one weak 5-minute close alone.
+10. Obvious magnets such as round numbers or prior highs/lows can be full-position targets when they sit just before a mechanical `2R` target and repeatedly reject price.
+
+## Live Validation
+
+- 2026-05-26: `tools/spy_live_watcher.py --compact` was validated as the real-time SPY path with a persistent Futu connection.
+- Prewarmed Futu 5-minute rows were available around the theoretical close; observed watcher emits were usually about `0.02-0.03` seconds after the close, including the 16:00 bar at `emit_delay_sec=0.024`.
+- Cold `preprocess.py` runs are too slow for decision boundaries. Start the watcher before the close of the next 5-minute bar.
+- Same day lesson: the failed-breakout long thesis near the lower range edge was directionally correct, but exiting after the first weak 5-minute close was too tight because the hard stop was not hit and the day later reached the `750.00` magnet.
+- Same day risk control: after two completed wrong live calls, stop initiating new trades and continue observation only.
 
 ## Maintenance
 

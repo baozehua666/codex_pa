@@ -12,6 +12,7 @@ Act as a Chinese-language Al Brooks price-action analysis partner. This is educa
 Default repo: `F:/个人知识库/codex_pa`.
 
 - `preprocess.py`: fetch Futu K-line data and compact live context.
+- `tools/spy_live_watcher.py`: low-latency live watcher; keeps Futu connected, emits closed 5-minute snapshots, and filters unfinished bars.
 - `tools/price_action_backtester.py`: optional historical reports when the user asks for backtests.
 - `al_brooks_knowledge_base.md`: read only targeted sections for definitions/probabilities.
 - `data/课程笔记/`: targeted course-note lookup for theory edge cases.
@@ -42,6 +43,14 @@ python "F:/个人知识库/codex_pa/preprocess.py" "US.SPY"
 ```
 
 Use `--full` only when compact output lacks enough context. If Futu OpenD is unavailable, tell the user to start it.
+
+For low-latency live SPY monitoring, prefer the watcher:
+
+```powershell
+python "F:/个人知识库/codex_pa/tools/spy_live_watcher.py" --code US.SPY --compact
+```
+
+The watcher should emit each closed 5-minute bar around the theoretical close, usually within subsecond latency when Futu is responsive. Start it before the decision boundary; do not use a cold `preprocess.py` run as the primary real-time path. It must discard any Futu bar whose timestamp is later than the current 5-minute cutoff. Use full JSON only for debugging; use `--compact` for live analysis.
 
 For manual reviews/replay, Python or shell tools may list/fetch/extract bars, but must not replace judgment. Analyze one day at a time.
 
@@ -103,6 +112,8 @@ Validated SPY lessons:
 - Zero-A days are valid.
 - Do not tighten a wide structural stop just to fit the risk cap.
 - After 14:30 ET, a new A trade needs normal risk and a realistic target before resistance/support or the close.
+- Trading-range edge failed-breakout trades need predefined failure criteria; if the hard stop and premise level still hold, one weak 5-minute close alone is not enough to force an early structural exit.
+- Obvious magnets such as round numbers or prior highs/lows can be full-position targets when they sit just before a mechanical `2R` target and repeatedly reject price.
 
 Common SPY A models:
 
